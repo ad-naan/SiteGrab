@@ -15,16 +15,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: sitegrab-linux-x86_64.tar.gz
+            binary: sitegrab
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: sitegrab-linux-aarch64.tar.gz
+            binary: sitegrab
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: sitegrab-macos-x86_64.tar.gz
+            binary: sitegrab
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: sitegrab-macos-aarch64.tar.gz
-
+            binary: sitegrab
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: sitegrab-windows-x86_64.zip
+            binary: sitegrab.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -52,11 +59,16 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare archive
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/sitegrab dist/
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
           cd dist
-          tar czf ${{ matrix.archive }} sitegrab
+          if [[ "${{ matrix.archive }}" == *.zip ]]; then
+            7z a ${{ matrix.archive }} ${{ matrix.binary }}
+          else
+            tar czf ${{ matrix.archive }} ${{ matrix.binary }}
+          fi
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
@@ -78,10 +90,10 @@ jobs:
           merge-multiple: true
 
       - name: Verify archives
-        run: ls -lh sitegrab-*.tar.gz
+        run: ls -lh sitegrab-*
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: sitegrab-*.tar.gz
+          files: sitegrab-*
           generate_release_notes: true

@@ -33,13 +33,15 @@ curl -sSL https://raw.githubusercontent.com/kerwin2046/SiteGrab/main/install.sh 
 ```bash
 cargo install --git https://github.com/kerwin2046/SiteGrab
 ```
-
 ### Pre-built binary (manual)
 
 ```bash
-# Linux x86_64
+# Linux / macOS
 curl -sSL https://github.com/kerwin2046/SiteGrab/releases/latest/download/sitegrab-linux-x86_64.tar.gz | tar xz
 sudo mv sitegrab /usr/local/bin/
+
+# Windows (PowerShell)
+# Download sitegrab-windows-x86_64.zip from the Releases page and unzip
 ```
 
 Requires Rust 1.75+ for source builds.
