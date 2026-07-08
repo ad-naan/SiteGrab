@@ -31,7 +31,6 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: sitegrab-windows-x86_64.zip
-            binary: sitegrab.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -40,23 +39,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation deps (Linux aarch64)
-        if: contains(matrix.target, 'aarch64-unknown-linux')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
-      - name: Set linker for aarch64 Linux
-        if: contains(matrix.target, 'aarch64-unknown-linux')
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
 
       - name: Prepare archive
         shell: bash
