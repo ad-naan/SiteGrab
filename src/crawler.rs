@@ -176,6 +176,13 @@ fn is_same_domain(url: &Url, base_host: &str) -> bool {
     host == base
 }
 
+/// Normalize URL for dedup: strip fragments, lowercase scheme+host.
+fn normalize_url(url: &Url) -> Url {
+    let mut u = url.clone();
+    u.set_fragment(None);
+    u
+}
+
 /// Process a single URL: download, save, return discovered links
 async fn process_one(
     client: &Client,
@@ -336,14 +343,16 @@ pub async fn crawl(
     let visited = Arc::new(Mutex::new(HashSet::new()));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let cache = Arc::new(rewriter::Cache::new());
-    let seed = url.clone();
+    let seed = normalize_url(url);
     let out_dir = output_dir.to_string();
 
     // Pre-populate visited set from manifest
     if let Some(ref mf) = manifest {
         let mf = mf.lock().await;
         for url_str in &mf.visited {
-            visited.lock().await.insert(Url::parse(url_str).unwrap());
+            if let Ok(u) = Url::parse(url_str) {
+                visited.lock().await.insert(normalize_url(&u));
+            }
         }
     }
 
@@ -411,9 +420,10 @@ pub async fn crawl(
                 }
 
                 for new_url in pr.new_urls {
+                    let norm = normalize_url(&new_url);
                     let is_new = {
                         let mut v = visited.lock().await;
-                        v.insert(new_url.clone())
+                        v.insert(norm.clone())
                     };
                     if !is_new {
                         continue;
@@ -422,9 +432,8 @@ pub async fn crawl(
                     // Check if already downloaded (incremental / resume)
                     if let Some(ref mf) = manifest {
                         let mf = mf.lock().await;
-                        if mf.is_fresh(new_url.as_str(), &out_dir) {
-                            // Count it in stats from manifest type
-                            let rtype = mf.rtype_of(new_url.as_str());
+                        if mf.is_fresh(norm.as_str(), &out_dir) {
+                            let rtype = mf.rtype_of(norm.as_str());
                             if let Some(rt) = rtype {
                                 record_skipped(&stats, rt);
                             }
@@ -434,8 +443,8 @@ pub async fn crawl(
 
                     // Check robots.txt
                     if let Some(ref robots) = robots {
-                        if !robots.is_allowed(new_url.path()) {
-                            eprintln!("  🚫 robots.txt: skipped {}", new_url.path());
+                        if !robots.is_allowed(norm.path()) {
+                            eprintln!("  🚫 robots.txt: skipped {}", norm.path());
                             continue;
                         }
                     }
@@ -470,6 +479,7 @@ pub async fn crawl(
             }
         }
     }
+
     // Collect all visited URLs
     let visited_urls: Vec<String> = {
         let v = visited.lock().await;
