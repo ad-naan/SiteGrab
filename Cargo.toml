@@ -1,0 +1,21 @@
+[package]
+name = "sitegrab"
+version = "0.1.0"
+edition = "2021"
+description = "Simple website mirroring tool — download, convert links, zip export"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream"] }
+scraper = "0.27"
+url = "2"
+indicatif = "0.18"
+zip = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mime_guess = "2"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
