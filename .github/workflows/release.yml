@@ -52,17 +52,24 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Prepare archive
+
+      - name: Prepare archive (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/
           cd dist
-          if [[ "${{ matrix.archive }}" == *.zip ]]; then
-            7z a ${{ matrix.archive }} ${{ matrix.binary }}
-          else
-            tar czf ${{ matrix.archive }} ${{ matrix.binary }}
-          fi
+          tar czf "${{ matrix.archive }}" "${{ matrix.binary }}"
+
+      - name: Prepare archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/
+          cd dist
+          Compress-Archive -Path "${{ matrix.binary }}" -DestinationPath "${{ matrix.archive }}"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
