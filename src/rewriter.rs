@@ -1,23 +1,7 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::path::Path;
 
 use regex::Regex;
 use url::Url;
-
-/// Cache for resolved URL → relative path mappings
-#[allow(dead_code)]
-pub struct Cache {
-    inner: Mutex<HashMap<String, String>>,
-}
-
-impl Cache {
-    pub fn new() -> Self {
-        Cache {
-            inner: Mutex::new(HashMap::new()),
-        }
-    }
-}
 
 /// Compute a relative filesystem path from `page_path` to `target_url` for offline browsing.
 ///
@@ -94,7 +78,7 @@ fn url_to_offline_path(url: &Url) -> String {
 }
 
 /// Rewrite HTML for offline browsing: convert absolute paths to relative.
-pub fn rewrite_html(html: &str, page_url: &Url, _cache: &Cache) -> String {
+pub fn rewrite_html(html: &str, page_url: &Url) -> String {
     // Early exit for common pattern: no links at all
     if !html.contains("href=") && !html.contains("src=") {
         return html.to_string();
@@ -161,9 +145,9 @@ pub fn rewrite_html(html: &str, page_url: &Url, _cache: &Cache) -> String {
             continue;
         }
 
-        // Skip if this would produce the same path (e.g. linking to self)
+        // Skip if this would produce the same path or a degenerate "." (self-reference)
         let new_path = relative_path(&page_path, &resolved);
-        if new_path == value {
+        if new_path == value || new_path == "." || new_path == page_path {
             result.push_str(matched);
             last_end = cap.end();
             continue;
@@ -218,8 +202,7 @@ mod tests {
     fn test_rewrite_html_simple() {
         let html = r#"<a href="/about">About</a>"#;
         let page = Url::parse("https://example.com/index.html").unwrap();
-        let cache = Cache::new();
-        let result = rewrite_html(html, &page, &cache);
+        let result = rewrite_html(html, &page);
         assert_eq!(result, r#"<a href="about/index.html">About</a>"#);
     }
 
@@ -227,8 +210,7 @@ mod tests {
     fn test_rewrite_image() {
         let html = r#"<img src="/images/logo.png">"#;
         let page = Url::parse("https://example.com/index.html").unwrap();
-        let cache = Cache::new();
-        let result = rewrite_html(html, &page, &cache);
+        let result = rewrite_html(html, &page);
         assert_eq!(result, r#"<img src="images/logo.png">"#);
     }
 
@@ -236,8 +218,7 @@ mod tests {
     fn test_rewrite_external_unchanged() {
         let html = r#"<a href="https://other.com/page">Link</a>"#;
         let page = Url::parse("https://example.com/index.html").unwrap();
-        let cache = Cache::new();
-        let result = rewrite_html(html, &page, &cache);
+        let result = rewrite_html(html, &page);
         assert_eq!(result, html);
     }
 
@@ -245,8 +226,16 @@ mod tests {
     fn test_rewrite_relative_unchanged() {
         let html = r##"<a href="#section">Anchor</a>"##;
         let page = Url::parse("https://example.com/index.html").unwrap();
-        let cache = Cache::new();
-        let result = rewrite_html(html, &page, &cache);
+        let result = rewrite_html(html, &page);
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_rewrite_self_reference_no_dot() {
+        // A link to the site root from a page at root should not become "."
+        let html = r#"<a href="/">Home</a>"#;
+        let page = Url::parse("https://example.com/").unwrap();
+        let result = rewrite_html(html, &page);
         assert_eq!(result, html);
     }
 }

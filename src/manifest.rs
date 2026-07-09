@@ -126,6 +126,15 @@ fn hash_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Generate a unique test directory under the system temp dir.
+    fn test_dir(name: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{}_{}", name, id));
+        path.to_string_lossy().to_string()
+    }
 
     #[test]
     fn test_hash_consistency() {
@@ -139,9 +148,9 @@ mod tests {
 
     #[test]
     fn test_manifest_save_load_roundtrip() {
-        let dir = "/tmp/_test_manifest";
-        let _ = fs::remove_dir_all(dir);
-        fs::create_dir_all(dir).unwrap();
+        let dir = test_dir("_test_manifest");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         let mut mf = Manifest::new("https://example.com/");
         mf.record(
@@ -152,26 +161,26 @@ mod tests {
             "page",
         );
         // Write the file to disk so is_fresh can verify it
-        std::fs::write(Path::new(dir).join("index.html"), b"<html>hello</html>").unwrap();
+        std::fs::write(Path::new(&dir).join("index.html"), b"<html>hello</html>").unwrap();
         mf.visited.push("https://example.com/".into());
-        mf.save_to(dir).unwrap();
+        mf.save_to(&dir).unwrap();
 
-        let loaded = Manifest::load_from(dir).unwrap().unwrap();
+        let loaded = Manifest::load_from(&dir).unwrap().unwrap();
         assert_eq!(loaded.start_url, "https://example.com/");
         assert_eq!(loaded.entries.len(), 1);
         assert!(loaded.entries.contains_key("https://example.com/"));
         assert!(loaded.visited.contains(&"https://example.com/".into()));
-        assert!(loaded.is_fresh("https://example.com/", dir));
+        assert!(loaded.is_fresh("https://example.com/", &dir));
         assert_eq!(loaded.rtype_of("https://example.com/"), Some("page"));
 
-        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_is_fresh_changed_file() {
-        let dir = "/tmp/_test_manifest2";
-        let _ = fs::remove_dir_all(dir);
-        fs::create_dir_all(dir).unwrap();
+        let dir = test_dir("_test_manifest2");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
 
         let mut mf = Manifest::new("https://example.com/");
         mf.record(
@@ -182,10 +191,10 @@ mod tests {
             "page",
         );
 
-        fs::write(Path::new(dir).join("index.html"), b"modified content").unwrap();
-        assert!(!mf.is_fresh("https://example.com/", dir));
+        fs::write(Path::new(&dir).join("index.html"), b"modified content").unwrap();
+        assert!(!mf.is_fresh("https://example.com/", &dir));
 
-        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
