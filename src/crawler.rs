@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::rewriter;
 use crate::manifest::Manifest;
+use crate::util::format_bytes;
 
 /// Crawl statistics
 pub struct Stats {
@@ -188,7 +189,6 @@ async fn process_one(
     client: &Client,
     url: &Url,
     output_base: &str,
-    cache: &rewriter::Cache,
     pb: &ProgressBar,
 ) -> Result<ProcessResult> {
     pb.set_message(format!("Fetching {}", url.path()));
@@ -229,7 +229,7 @@ async fn process_one(
 
     let new_urls = if rtype == ResourceType::Page {
         let html_str = String::from_utf8_lossy(&body);
-        let rewritten = rewriter::rewrite_html(&html_str, url, cache);
+        let rewritten = rewriter::rewrite_html(&html_str, url);
         tokio::fs::write(&save_path, rewritten.as_bytes()).await?;
 
         let doc = Html::parse_document(&html_str);
@@ -240,9 +240,10 @@ async fn process_one(
         Vec::new()
     };
 
+    let norm = normalize_url(url);
     Ok(ProcessResult {
         rtype,
-        url: url.as_str().to_string(),
+        url: norm.as_str().to_string(),
         save_path: save_path_rel,
         new_urls,
         bytes: body.to_vec(),
@@ -307,22 +308,74 @@ impl RobotsChecker {
     }
 
     /// Check if a URL path is allowed by robots.txt.
+    ///
+    /// Per RFC 9309, the most specific (longest) matching rule wins.
+    /// If allow and disallow match with the same length, allow wins.
     fn is_allowed(&self, path: &str) -> bool {
-        // Allow rules take priority over disallow rules
-        for allow in &self.allows {
-            if path.starts_with(allow) {
-                return true;
+        let mut best_len = 0usize;
+        let mut best_allowed = true;
+
+        for rule in &self.disallows {
+            if path.starts_with(rule.as_str()) && rule.len() > best_len {
+                best_len = rule.len();
+                best_allowed = false;
             }
         }
-        for disallow in &self.disallows {
-            if path.starts_with(disallow) {
-                return false;
+        for rule in &self.allows {
+            if path.starts_with(rule.as_str()) && rule.len() >= best_len {
+                best_len = rule.len();
+                best_allowed = true;
             }
         }
-        true
+        best_allowed
     }
 }
 
+#[cfg(test)]
+mod robots_tests {
+    use super::*;
+
+    #[test]
+    fn test_robots_no_rules() {
+        let checker = RobotsChecker {
+            disallows: vec![],
+            allows: vec![],
+        };
+        assert!(checker.is_allowed("/anything"));
+    }
+
+    #[test]
+    fn test_robots_disallow() {
+        let checker = RobotsChecker {
+            disallows: vec!["/private".to_string()],
+            allows: vec![],
+        };
+        assert!(!checker.is_allowed("/private/secret"));
+        assert!(checker.is_allowed("/public"));
+    }
+
+    #[test]
+    fn test_robots_longest_match_wins() {
+        // /private is disallowed, but /private/public is explicitly allowed.
+        // The longer (more specific) Allow rule should win.
+        let checker = RobotsChecker {
+            disallows: vec!["/private".to_string()],
+            allows: vec!["/private/public".to_string()],
+        };
+        assert!(checker.is_allowed("/private/public/page"));
+        assert!(!checker.is_allowed("/private/secret"));
+    }
+
+    #[test]
+    fn test_robots_equal_length_allow_wins() {
+        // When Allow and Disallow rules match with equal length, Allow wins.
+        let checker = RobotsChecker {
+            disallows: vec!["/path".to_string()],
+            allows: vec!["/path".to_string()],
+        };
+        assert!(checker.is_allowed("/path/page"));
+    }
+}
 /// Run a full BFS crawl of a website.
 pub async fn crawl(
     url: &Url,
@@ -342,7 +395,6 @@ pub async fn crawl(
     let stats = Arc::new(AtomicStats::default());
     let visited = Arc::new(Mutex::new(HashSet::new()));
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let cache = Arc::new(rewriter::Cache::new());
     let seed = normalize_url(url);
     let out_dir = output_dir.to_string();
 
@@ -390,12 +442,11 @@ pub async fn crawl(
     // Clone before first spawn
     let c1 = Arc::clone(&client);
     let s1 = Arc::clone(&stats);
-    let ca1 = Arc::clone(&cache);
     let pb1 = Arc::clone(&pb);
     let o1 = out_dir.clone();
     set.spawn(async move {
         let _permit = permit;
-        let res = process_one(&c1, &seed, &o1, &ca1, &pb1).await;
+        let res = process_one(&c1, &seed, &o1, &pb1).await;
         match res {
             Ok(pr) => {
                 s1.record(pr.rtype, pr.bytes.len() as u64);
@@ -452,12 +503,11 @@ pub async fn crawl(
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     let c = Arc::clone(&client);
                     let s = Arc::clone(&stats);
-                    let ca = Arc::clone(&cache);
                     let p = Arc::clone(&pb);
                     let o = out_dir.clone();
                     set.spawn(async move {
                         let _permit = permit;
-                        let res = process_one(&c, &new_url, &o, &ca, &p).await;
+                        let res = process_one(&c, &new_url, &o, &p).await;
                         match res {
                             Ok(pr) => {
                                 s.record(pr.rtype, pr.bytes.len() as u64);
@@ -581,17 +631,3 @@ impl AtomicStats {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size > 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
-    } else {
-        format!("{:.1} {}", size, UNITS[unit])
-    }
-}

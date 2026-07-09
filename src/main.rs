@@ -7,6 +7,7 @@ mod archiver;
 mod crawler;
 mod manifest;
 mod rewriter;
+mod util;
 
 #[derive(Parser)]
 #[command(
@@ -75,6 +76,7 @@ async fn main() {
     let output_dir = args.output.unwrap_or_else(|| host.clone());
 
     // Load or create manifest
+    let mut loaded_existing_manifest = false;
     let manifest = if args.fresh {
         let mf = manifest::Manifest::new(url.as_str());
         std::fs::create_dir_all(&output_dir).ok();
@@ -85,6 +87,7 @@ async fn main() {
         match manifest::Manifest::load_from(&output_dir) {
             Ok(Some(mf)) => {
                 eprintln!("info: Found existing manifest — incremental mode");
+                loaded_existing_manifest = true;
                 Some(tokio::sync::Mutex::new(mf))
             }
             Ok(None) => {
@@ -105,10 +108,8 @@ async fn main() {
     println!("Mirroring: {}", url);
     println!("Output:    {}/", output_dir);
     println!("Workers:   {}", args.jobs);
-    if !args.fresh {
-        if manifest::Manifest::load_from(&output_dir).ok().flatten().is_some() {
-            println!("Mode:     incremental (use --fresh for full re-download)");
-        }
+    if !args.fresh && loaded_existing_manifest {
+        println!("Mode:     incremental (use --fresh for full re-download)");
     }
     println!();
 
