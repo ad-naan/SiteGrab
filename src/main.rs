@@ -9,6 +9,9 @@ mod manifest;
 mod rewriter;
 mod util;
 
+#[cfg(feature = "render")]
+mod renderer;
+
 #[derive(Parser)]
 #[command(
     name = "sitegrab",
@@ -45,6 +48,16 @@ struct Args {
     /// Respect robots.txt (default: no)
     #[arg(long)]
     robots: bool,
+
+    /// Render SPA pages (Vue/React/Angular) with a headless browser.
+    /// Requires a Chrome/Chromium/Edge install and a `render` feature build.
+    #[arg(long)]
+    render: bool,
+
+    /// Settle time (ms) to wait after page load for lazy/AJAX content.
+    /// Only relevant with --render. Default: 1500
+    #[arg(long, default_value = "1500")]
+    wait: u64,
 }
 
 #[tokio::main]
@@ -111,9 +124,28 @@ async fn main() {
     if !args.fresh && loaded_existing_manifest {
         println!("Mode:     incremental (use --fresh for full re-download)");
     }
+    if args.render {
+        println!("Mode:     SPA render (headless browser)");
+    }
     println!();
 
-    match crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots).await {
+    let crawl_result = if args.render {
+        #[cfg(feature = "render")]
+        {
+            crawler::crawl_spa(&url, &output_dir, args.jobs, manifest, args.robots, args.wait).await
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            let _ = (output_dir, args.jobs, args.robots, args.wait);
+            eprintln!("error: this binary was not compiled with SPA rendering support.");
+            eprintln!("       Rebuild with: cargo build --features render");
+            process::exit(1);
+        }
+    } else {
+        crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots).await
+    };
+
+    match crawl_result {
         Ok(stats) => {
             if !args.no_zip {
                 let zip_path = format!("{}.zip", output_dir);

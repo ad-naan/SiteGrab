@@ -36,7 +36,7 @@ enum ResourceType {
 }
 
 /// Result from processing one URL
-struct ProcessResult {
+pub(crate) struct ProcessResult {
     rtype: ResourceType,
     url: String,
     save_path: String,
@@ -122,7 +122,7 @@ fn url_to_path(url: &Url, output_base: &str) -> PathBuf {
 }
 
 /// Resolve a potentially relative URL, skipping non-HTTP(S) protocols
-fn resolve_url(base: &Url, href: &str) -> Option<Url> {
+pub(crate) fn resolve_url(base: &Url, href: &str) -> Option<Url> {
     let href = href.trim();
     if href.starts_with('#')
         || href.starts_with("javascript:")
@@ -167,7 +167,7 @@ fn extract_urls(doc: &Html, base_url: &Url, base_host: &str) -> Vec<Url> {
     urls
 }
 
-fn is_same_domain(url: &Url, base_host: &str) -> bool {
+pub(crate) fn is_same_domain(url: &Url, base_host: &str) -> bool {
     let host = match url.host_str() {
         Some(h) => h,
         None => return false,
@@ -185,7 +185,7 @@ fn normalize_url(url: &Url) -> Url {
 }
 
 /// Process a single URL: download, save, return discovered links
-async fn process_one(
+pub(crate) async fn process_one(
     client: &Client,
     url: &Url,
     output_base: &str,
@@ -631,3 +631,296 @@ impl AtomicStats {
     }
 }
 
+// ============================================================================
+// SPA rendering mode (Vue / React / Angular)
+// Requires the `render` feature and a Chromium/Chrome binary at runtime.
+// ============================================================================
+
+#[cfg(feature = "render")]
+mod spa {
+    use super::*;
+    use crate::manifest::Manifest;
+    use crate::renderer;
+    use futures::StreamExt;
+    use std::collections::{HashSet, VecDeque};
+
+    /// Crawl a SPA site: render every route with a headless browser,
+    /// download all assets the browser fetched, then save pre-rendered HTML.
+    ///
+    /// - `wait_ms`: extra settle time after page load (for lazy-loaded content).
+    pub async fn crawl_spa(
+        url: &Url,
+        output_dir: &str,
+        concurrency: usize,
+        manifest: Option<tokio::sync::Mutex<Manifest>>,
+        respect_robots: bool,
+        wait_ms: u64,
+    ) -> Result<Stats> {
+        let client = Arc::new(
+            Client::builder()
+                .user_agent("Mozilla/5.0 (compatible; SiteGrab/0.1)")
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+        );
+
+        let stats = Arc::new(AtomicStats::default());
+        let out_dir = output_dir.to_string();
+        let base_host = url.host_str().unwrap_or("").to_string();
+        let host_norm = base_host.strip_prefix("www.").unwrap_or(&base_host).to_string();
+
+        // Launch headless browser.
+        eprintln!("info: Launching headless browser for SPA rendering...");
+        let (browser, mut handler) = renderer::launch_browser_async().await?;
+        let _handler_task = tokio::spawn(async move {
+            while handler.next().await.is_some() {}
+        });
+
+        // robots.txt
+        let robots = if respect_robots {
+            let checker = RobotsChecker::fetch(&client, url).await;
+            if !checker.disallows.is_empty() || !checker.allows.is_empty() {
+                eprintln!(
+                    "info: robots.txt loaded ({} disallows, {} allows)",
+                    checker.disallows.len(),
+                    checker.allows.len()
+                );
+            }
+            Some(checker)
+        } else {
+            None
+        };
+
+        let pb = Arc::new(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        // BFS frontier of routes to render.
+        let mut visited: HashSet<Url> = HashSet::new();
+        // Track assets already downloaded (or queued).
+        let mut done_assets: HashSet<Url> = HashSet::new();
+
+        // Pre-populate visited/asset sets from manifest for incremental mode.
+        if let Some(ref mf) = manifest {
+            let mf = mf.lock().await;
+            for u in &mf.visited {
+                if let Ok(parsed) = Url::parse(u) {
+                    visited.insert(normalize_url(&parsed));
+                }
+            }
+        }
+
+        let mut queue: VecDeque<Url> = VecDeque::new();
+        let seed = normalize_url(url);
+        visited.insert(seed.clone());
+        queue.push_back(seed);
+
+        // Semaphore for asset downloads.
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+
+        while let Some(route) = queue.pop_front() {
+            // robots.txt check for this route
+            if let Some(ref r) = robots {
+                if !r.is_allowed(route.path()) {
+                    eprintln!("  🚫 robots.txt: skipped {}", route);
+                    continue;
+                }
+            }
+
+            pb.set_message(format!("Rendering {}", route));
+            let render = match renderer::render_page(&browser, &route, &host_norm, wait_ms).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  ⚠ render failed for {route}: {e}");
+                    stats.record_err();
+                    continue;
+                }
+            };
+
+            // --- Save the rendered HTML ---
+            let page_url = &render.final_url;
+            let rewritten = crate::rewriter::rewrite_html(&render.html, page_url);
+
+            let save_path = url_to_path(page_url, &out_dir);
+            let save_path_rel = save_path
+                .strip_prefix(&out_dir)
+                .unwrap_or(&save_path)
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string();
+
+            if let Some(parent) = save_path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    eprintln!("  ⚠ mkdir failed: {e}");
+                }
+            }
+            let html_bytes = rewritten.as_bytes();
+            if let Err(e) = tokio::fs::write(&save_path, html_bytes).await {
+                eprintln!("  ⚠ write failed for {}: {e}", save_path.display());
+                stats.record_err();
+            } else {
+                stats.record(ResourceType::Page, html_bytes.len() as u64);
+
+                // Record in manifest.
+                if let Some(ref mf) = manifest {
+                    let mut mf = mf.lock().await;
+                    let norm = normalize_url(page_url);
+                    mf.record(
+                        norm.as_str().to_string(),
+                        save_path_rel.clone(),
+                        html_bytes,
+                        None,
+                        "page",
+                    );
+                }
+            }
+
+            // --- Download all assets the browser requested ---
+            let mut assets: Vec<Url> = Vec::new();
+            for asset_url in &render.resource_urls {
+                let norm = normalize_url(asset_url);
+
+                // Skip CDN-internal and analytics endpoints that can't be
+                // meaningfully downloaded (Cloudflare RUM, ___cflb, etc.).
+                let path = norm.path();
+                if path.starts_with("/cdn-cgi/")
+                    || path.contains("/__cf_")
+                    || path.ends_with("/rum")
+                    || path.contains("cloudflareinsights")
+                {
+                    continue;
+                }
+
+                if done_assets.insert(norm.clone()) {
+                    // Skip if already fresh in manifest (incremental).
+                    let already_fresh = if let Some(ref mf) = manifest {
+                        let mf = mf.lock().await;
+                        if mf.is_fresh(norm.as_str(), &out_dir) {
+                            if let Some(rt) = mf.rtype_of(norm.as_str()) {
+                                record_skipped(&stats, rt);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !already_fresh {
+                        assets.push(norm);
+                    }
+                }
+            }
+
+            // Download assets concurrently.
+            download_assets(
+                &assets,
+                &client,
+                &out_dir,
+                &pb,
+                &stats,
+                &semaphore,
+                &manifest,
+            )
+            .await;
+
+            // --- Enqueue new internal links ---
+            for link in &render.links {
+                let norm = normalize_url(link);
+                if visited.insert(norm.clone()) {
+                    // Only enqueue paths that look like routes (not static assets).
+                    let path = norm.path().to_lowercase();
+                    let last_seg = path.rsplit('/').next().unwrap_or("");
+                    let has_ext = last_seg.contains('.');
+                    if !has_ext || path.ends_with(".html") || path.ends_with(".htm") {
+                        queue.push_back(norm);
+                    }
+                }
+            }
+        }
+
+        // Persist manifest.
+        if let Some(ref mf) = manifest {
+            let mut mf = mf.lock().await;
+            for u in &visited {
+                let s = u.to_string();
+                if !mf.visited.contains(&s) {
+                    mf.visited.push(s);
+                }
+            }
+            let _ = mf.save_to(&out_dir);
+        }
+
+        drop(browser);
+
+        let s = stats.load();
+        println!();
+        println!("📄 Pages rendered: {}", s.pages);
+        println!("🖼  Images: {}", s.images);
+        println!("🎨 CSS: {}", s.css);
+        println!("📦 JS: {}", s.js);
+        println!("📁 Size: {}", format_bytes(s.total_bytes));
+        if s.errors > 0 {
+            println!("⚠  Errors: {}", s.errors);
+        }
+        println!();
+        println!("✓ SPA render completed");
+        println!("✓ Offline ready");
+
+        Ok(s)
+    }
+
+    /// Download a batch of asset URLs concurrently using process_one.
+    async fn download_assets(
+        urls: &[Url],
+        client: &Arc<Client>,
+        out_dir: &str,
+        pb: &Arc<ProgressBar>,
+        stats: &Arc<AtomicStats>,
+        semaphore: &Arc<Semaphore>,
+        manifest: &Option<tokio::sync::Mutex<Manifest>>,
+    ) {
+        let mut set: JoinSet<std::result::Result<ProcessResult, anyhow::Error>> = JoinSet::new();
+
+        for url in urls {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let c = Arc::clone(client);
+            let p = Arc::clone(pb);
+            let url = url.clone();
+            let o = out_dir.to_string();
+
+            set.spawn(async move {
+                let _permit = permit;
+                process_one(&c, &url, &o, &p).await
+            });
+        }
+
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok(pr)) => {
+                    stats.record(pr.rtype, pr.bytes.len() as u64);
+                    if let Some(mf) = manifest {
+                        let mut mf = mf.lock().await;
+                        let rtype_str = rtype_to_str(pr.rtype);
+                        mf.record(pr.url, pr.save_path, &pr.bytes, pr.mtime, rtype_str);
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("  ⚡ asset download error: {e}");
+                    stats.record_err();
+                }
+                Err(e) => {
+                    eprintln!("  ⚡ task panic: {e}");
+                    stats.record_err();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+pub use spa::crawl_spa;
