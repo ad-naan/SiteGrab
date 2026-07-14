@@ -5,15 +5,16 @@ edition = "2021"
 description = "Simple website mirroring tool — download, convert links, zip export"
 
 [features]
-default = []
-# Enable SPA rendering (Vue/React/Angular) via headless browser.
+# SPA rendering (Vue/React/Angular) via headless browser is enabled by default.
+# It is needed for auto-detecting and crawling JavaScript-rendered sites.
 # Requires Chrome/Chromium installed at runtime.
+default = ["render"]
 render = ["dep:chromiumoxide", "dep:futures"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate"] }
 scraper = "0.27"
 url = "2"
 indicatif = "0.18"

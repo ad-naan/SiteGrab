@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -34,7 +34,7 @@ pub struct Manifest {
     pub created_at: String,
     pub updated_at: String,
     pub entries: HashMap<String, Entry>,
-    pub visited: Vec<String>,
+    pub visited: HashSet<String>,
 }
 
 impl Manifest {
@@ -46,9 +46,10 @@ impl Manifest {
             created_at: now.clone(),
             updated_at: now,
             entries: HashMap::new(),
-            visited: Vec::new(),
+            visited: HashSet::new(),
         }
     }
+
 
     pub fn load_from(dir: &str) -> Result<Option<Self>> {
         let path = Path::new(dir).join(MANIFEST_FILE);
@@ -162,14 +163,14 @@ mod tests {
         );
         // Write the file to disk so is_fresh can verify it
         std::fs::write(Path::new(&dir).join("index.html"), b"<html>hello</html>").unwrap();
-        mf.visited.push("https://example.com/".into());
+        mf.visited.insert("https://example.com/".into());
         mf.save_to(&dir).unwrap();
 
         let loaded = Manifest::load_from(&dir).unwrap().unwrap();
         assert_eq!(loaded.start_url, "https://example.com/");
         assert_eq!(loaded.entries.len(), 1);
         assert!(loaded.entries.contains_key("https://example.com/"));
-        assert!(loaded.visited.contains(&"https://example.com/".into()));
+        assert!(loaded.visited.contains("https://example.com/"));
         assert!(loaded.is_fresh("https://example.com/", &dir));
         assert_eq!(loaded.rtype_of("https://example.com/"), Some("page"));
 

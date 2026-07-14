@@ -77,6 +77,15 @@ fn add_dir<W: Write + std::io::Seek>(
         if path.is_dir() {
             add_dir(zip, base, &path, options, pb)?;
         } else {
+            // Skip the internal manifest file — it's tool state, not site content.
+            if path
+                .file_name()
+                .map(|n| n == ".sitegrab.json")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let relative = path
                 .strip_prefix(base)
                 .unwrap_or(&path)

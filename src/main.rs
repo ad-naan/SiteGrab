@@ -22,6 +22,9 @@ sitegrab — Download a website for offline browsing.
 Simple one-command mirroring:
   sitegrab https://example.com
 
+Automatically detects SPA (Vue/React/Angular) sites and renders them
+with a headless browser so the content is fully captured.
+
 Supports incremental updates — re-running mirrors only new/changed files.
 Use --robots to obey robots.txt, --fresh for a full re-download."
 )]
@@ -49,13 +52,15 @@ struct Args {
     #[arg(long)]
     robots: bool,
 
-    /// Render SPA pages (Vue/React/Angular) with a headless browser.
-    /// Requires a Chrome/Chromium/Edge install and a `render` feature build.
-    #[arg(long)]
-    render: bool,
+    /// SPA rendering mode: auto (default), on, or off.
+    /// "auto" detects whether the site is a SPA and renders if needed.
+    /// "on" forces headless-browser rendering for every page.
+    /// "off" uses plain HTTP crawling only.
+    #[arg(long, default_value = "auto")]
+    render: String,
 
     /// Settle time (ms) to wait after page load for lazy/AJAX content.
-    /// Only relevant with --render. Default: 1500
+    /// Only relevant when rendering is active. Default: 1500
     #[arg(long, default_value = "1500")]
     wait: u64,
 }
@@ -88,31 +93,60 @@ async fn main() {
 
     let output_dir = args.output.unwrap_or_else(|| host.clone());
 
+    // Normalise render option: "auto" (default) detects SPA automatically,
+    // "on"/"yes" forces render, "off"/"no" forces plain HTTP crawl.
+    let render_opt = args.render.to_lowercase();
+    let force_static = render_opt == "off" || render_opt == "no" || render_opt == "false";
+    let force_render = render_opt == "on" || render_opt == "yes" || render_opt == "true";
+
+    // ── Determine crawl mode ──────────────────────────────────────────
+    // If the user didn't explicitly choose, fetch the first page and
+    // analyse it to decide whether headless-browser rendering is needed.
+    let use_render = if force_render {
+        true
+    } else if force_static {
+        false
+    } else {
+        // Auto-detect
+        eprintln!("info: Detecting site type...");
+        let is_spa = crawler::detect_spa(&url).await;
+        if is_spa {
+            eprintln!("info: SPA detected (React/Vue/Angular) — switching to render mode");
+        } else {
+            eprintln!("info: Static site detected — plain HTTP crawl");
+        }
+        is_spa
+    };
+
+    // Verify render support is compiled in
+    #[cfg(not(feature = "render"))]
+    if use_render {
+        eprintln!("error: SPA rendering is needed but this binary was built without the `render` feature.");
+        eprintln!("       Rebuild with: cargo build --features render");
+        process::exit(1);
+    }
+
     // Load or create manifest
-    let mut loaded_existing_manifest = false;
-    let manifest = if args.fresh {
+    let (manifest, loaded_existing_manifest) = if args.fresh {
+        let _ = std::fs::create_dir_all(&output_dir);
         let mf = manifest::Manifest::new(url.as_str());
-        std::fs::create_dir_all(&output_dir).ok();
         let _ = mf.save_to(&output_dir);
         eprintln!("info: Fresh download, created new manifest");
-        Some(tokio::sync::Mutex::new(mf))
+        (Some(tokio::sync::Mutex::new(mf)), false)
     } else {
         match manifest::Manifest::load_from(&output_dir) {
             Ok(Some(mf)) => {
                 eprintln!("info: Found existing manifest — incremental mode");
-                loaded_existing_manifest = true;
-                Some(tokio::sync::Mutex::new(mf))
+                (Some(tokio::sync::Mutex::new(mf)), true)
             }
             Ok(None) => {
-                let mf = manifest::Manifest::new(url.as_str());
-                std::fs::create_dir_all(&output_dir).ok();
-                Some(tokio::sync::Mutex::new(mf))
+                let _ = std::fs::create_dir_all(&output_dir);
+                (Some(tokio::sync::Mutex::new(manifest::Manifest::new(url.as_str()))), false)
             }
             Err(e) => {
                 eprintln!("warning: Failed to load manifest: {e}, starting fresh");
-                let mf = manifest::Manifest::new(url.as_str());
-                std::fs::create_dir_all(&output_dir).ok();
-                Some(tokio::sync::Mutex::new(mf))
+                let _ = std::fs::create_dir_all(&output_dir);
+                (Some(tokio::sync::Mutex::new(manifest::Manifest::new(url.as_str()))), false)
             }
         }
     };
@@ -121,25 +155,25 @@ async fn main() {
     println!("Mirroring: {}", url);
     println!("Output:    {}/", output_dir);
     println!("Workers:   {}", args.jobs);
-    if !args.fresh && loaded_existing_manifest {
-        println!("Mode:     incremental (use --fresh for full re-download)");
+    if use_render {
+        println!("Mode:      SPA render (headless browser)");
+    } else {
+        println!("Mode:      plain HTTP crawl");
     }
-    if args.render {
-        println!("Mode:     SPA render (headless browser)");
+    if !args.fresh && loaded_existing_manifest {
+        println!("           incremental (use --fresh for full re-download)");
     }
     println!();
 
-    let crawl_result = if args.render {
+    let crawl_result = if use_render {
         #[cfg(feature = "render")]
         {
             crawler::crawl_spa(&url, &output_dir, args.jobs, manifest, args.robots, args.wait).await
         }
         #[cfg(not(feature = "render"))]
         {
-            let _ = (output_dir, args.jobs, args.robots, args.wait);
-            eprintln!("error: this binary was not compiled with SPA rendering support.");
-            eprintln!("       Rebuild with: cargo build --features render");
-            process::exit(1);
+            // Unreachable — guarded above
+            Err(anyhow::anyhow!("render feature not enabled"))
         }
     } else {
         crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots).await

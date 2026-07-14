@@ -1,2 +1,6 @@
 /target
 .adnify/
+
+# Crawl output
+/*.zip
+/www.adnaan.site/
