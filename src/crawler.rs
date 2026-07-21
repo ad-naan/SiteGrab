@@ -16,6 +16,14 @@ use crate::pathmap;
 use crate::rewriter;
 use crate::util::format_bytes;
 
+/// Crawl completion status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrawlOutcome {
+    Complete,
+    Partial,
+    Failed,
+}
+
 /// Crawl statistics
 pub struct Stats {
     pub pages: usize,
@@ -24,6 +32,7 @@ pub struct Stats {
     pub js: usize,
     pub total_bytes: u64,
     pub errors: usize,
+    pub outcome: CrawlOutcome,
 }
 
 /// Soft caps for a crawl run.
@@ -68,9 +77,14 @@ enum ResourceType {
 /// Result from processing one URL
 pub(crate) struct ProcessResult {
     rtype: ResourceType,
+    /// Canonical URL key for manifest/dedup.
     url: String,
+    /// Original URL before normalization.
+    original_url: String,
     save_path: String,
     new_urls: Vec<Url>,
+    /// Canonical page outlinks (pages only).
+    outlinks: Vec<String>,
     /// Final on-disk bytes (for manifest hashing).
     bytes: Vec<u8>,
     mtime: Option<String>,
@@ -87,6 +101,7 @@ pub(crate) struct PriorState {
     pub local_fresh: bool,
     pub rtype: Option<String>,
     pub rel_path: Option<String>,
+    pub outlinks: Option<Vec<String>>,
 }
 
 /// Determine resource type from content-type header and URL path
@@ -150,8 +165,39 @@ fn classify_by_ext(path: &str) -> ResourceType {
 }
 
 /// Convert URL to filesystem path under `output_base` (traversal-safe).
-fn url_to_path(url: &Url, output_base: &str) -> PathBuf {
-    pathmap::url_to_path(url, output_base)
+fn url_to_path(
+    url: &Url,
+    output_base: &str,
+    base_host: &str,
+    base_port: Option<u16>,
+    rtype: ResourceType,
+) -> PathBuf {
+    let kind = match rtype {
+        ResourceType::Page => pathmap::UrlKind::Page,
+        _ => pathmap::UrlKind::Asset,
+    };
+    pathmap::url_to_path_with(url, output_base, base_host, base_port, kind)
+}
+
+fn canonical_url(url: &Url, base_host: &str, rtype: ResourceType) -> Url {
+    let kind = match rtype {
+        ResourceType::Page => pathmap::UrlKind::Page,
+        _ => pathmap::UrlKind::Asset,
+    };
+    pathmap::normalize_url(url, kind, base_host)
+}
+
+fn is_enqueueable_page(url: &Url, base_host: &str) -> bool {
+    if pathmap::is_dynamic_request(url) {
+        return false;
+    }
+    if !is_same_domain(url, base_host) {
+        return false;
+    }
+    let path = url.path().to_lowercase();
+    let last_seg = path.rsplit('/').next().unwrap_or("");
+    let has_ext = last_seg.contains('.');
+    !has_ext || path.ends_with(".html") || path.ends_with(".htm")
 }
 
 /// Resolve a potentially relative URL, skipping non-HTTP(S) protocols
@@ -172,37 +218,46 @@ pub(crate) fn resolve_url(base: &Url, href: &str) -> Option<Url> {
         .filter(|u| u.scheme() == "http" || u.scheme() == "https")
 }
 
-/// Extract same-domain URLs from an HTML document.
-///
-/// Handles:
-///   - Regular `href`/`src` attributes
-///   - `srcset` multi-URL attributes
-///   - Lazy-load `data-src`, `data-lazy-src` attributes
-///   - `<base href>` resolution
-fn extract_urls(doc: &Html, page_url: &Url, base_host: &str) -> Vec<Url> {
+fn extract_page_links(doc: &Html, page_url: &Url, base_host: &str) -> Vec<Url> {
     let mut urls = Vec::new();
+    let base_url = resolve_base_url(doc, page_url);
+    for sel_str in &["a[href]", "area[href]"] {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            for elem in doc.select(&sel) {
+                if let Some(val) = elem.value().attr("href") {
+                    if let Some(abs_url) = resolve_url(&base_url, val) {
+                        if is_enqueueable_page(&abs_url, base_host) {
+                            urls.push(abs_url);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    urls
+}
 
-    // Resolve <base href> for relative URLs.
-    let base_url = {
-        let base_sel = Selector::parse("base[href]").ok();
-        let base_href = base_sel
-            .and_then(|sel| doc.select(&sel).next())
-            .and_then(|el| el.value().attr("href"))
-            .and_then(|href| page_url.join(href).ok());
+fn resolve_base_url(doc: &Html, page_url: &Url) -> Url {
+    let base_sel = Selector::parse("base[href]").ok();
+    let base_href = base_sel
+        .and_then(|sel| doc.select(&sel).next())
+        .and_then(|el| el.value().attr("href"))
+        .and_then(|href| page_url.join(href).ok());
+    base_href.unwrap_or_else(|| page_url.clone())
+}
 
-        base_href.unwrap_or_else(|| page_url.clone())
-    };
+/// Extract mirrorable static resources referenced by an HTML document.
+fn extract_urls(doc: &Html, page_url: &Url, base_host: &str, base_port: Option<u16>) -> Vec<Url> {
+    let mut urls = Vec::new();
+    let base_url = resolve_base_url(doc, page_url);
 
     let pairs = [
-        ("a[href]", "href"),
         ("link[href]", "href"),
-        ("area[href]", "href"),
         ("script[src]", "src"),
         ("img[src]", "src"),
         ("source[src]", "src"),
         ("video[src]", "src"),
         ("audio[src]", "src"),
-        // Lazy-load attributes
         ("img[data-src]", "data-src"),
         ("img[data-lazy-src]", "data-lazy-src"),
         ("source[data-src]", "data-src"),
@@ -215,7 +270,9 @@ fn extract_urls(doc: &Html, page_url: &Url, base_host: &str) -> Vec<Url> {
             for elem in doc.select(&sel) {
                 if let Some(val) = elem.value().attr(attr) {
                     if let Some(abs_url) = resolve_url(&base_url, val) {
-                        if is_same_domain(&abs_url, base_host) {
+                        if pathmap::is_mirrorable_static(&abs_url, base_host, base_port)
+                            && !pathmap::is_dynamic_request(&abs_url)
+                        {
                             urls.push(abs_url);
                         }
                     }
@@ -224,14 +281,15 @@ fn extract_urls(doc: &Html, page_url: &Url, base_host: &str) -> Vec<Url> {
         }
     }
 
-    // Parse srcset attributes (img[srcset], source[srcset])
     for sel_str in &["img[srcset]", "source[srcset]"] {
         if let Ok(sel) = Selector::parse(sel_str) {
             for elem in doc.select(&sel) {
                 if let Some(srcset) = elem.value().attr("srcset") {
                     for url_part in extract_srcset_urls(srcset) {
                         if let Some(abs_url) = resolve_url(&base_url, &url_part) {
-                            if is_same_domain(&abs_url, base_host) {
+                            if pathmap::is_mirrorable_static(&abs_url, base_host, base_port)
+                                && !pathmap::is_dynamic_request(&abs_url)
+                            {
                                 urls.push(abs_url);
                             }
                         }
@@ -265,19 +323,33 @@ pub(crate) fn is_same_domain(url: &Url, base_host: &str) -> bool {
     host == base
 }
 
-/// Normalize URL for dedup: strip fragments, lowercase scheme+host.
-fn normalize_url(url: &Url) -> Url {
-    let mut u = url.clone();
-    u.set_fragment(None);
-    u
+/// Normalize URL for dedup using canonical page/asset identity.
+fn normalize_url(url: &Url, base_host: &str, rtype: ResourceType) -> Url {
+    canonical_url(url, base_host, rtype)
 }
 
 /// Maximum retry attempts for transient errors (5xx, connection failures).
 const MAX_RETRIES: u32 = 2;
 
-/// Reuse a locally fresh file: extract links for pages/CSS, skip download.
-async fn reuse_local(url: &Url, output_base: &str, prior: &PriorState) -> Result<ProcessResult> {
-    let save_path = url_to_path(url, output_base);
+/// Reuse a locally fresh file: restore outlinks from manifest for pages.
+async fn reuse_local(
+    url: &Url,
+    output_base: &str,
+    base_host: &str,
+    base_port: Option<u16>,
+    prior: &PriorState,
+) -> Result<ProcessResult> {
+    let rtype = match prior.rtype.as_deref() {
+        Some("page") => ResourceType::Page,
+        Some("css") => ResourceType::Css,
+        Some("js") => ResourceType::Js,
+        Some("image") => ResourceType::Image,
+        Some(_) => ResourceType::Other,
+        None => classify_by_ext(url.path()),
+    };
+
+    let canonical = canonical_url(url, base_host, rtype);
+    let save_path = url_to_path(url, output_base, base_host, base_port, rtype);
     let save_path_rel = prior.rel_path.clone().unwrap_or_else(|| {
         save_path
             .strip_prefix(output_base)
@@ -288,35 +360,43 @@ async fn reuse_local(url: &Url, output_base: &str, prior: &PriorState) -> Result
     });
 
     let body = tokio::fs::read(&save_path).await?;
-    let rtype = match prior.rtype.as_deref() {
-        Some("page") => ResourceType::Page,
-        Some("css") => ResourceType::Css,
-        Some("js") => ResourceType::Js,
-        Some("image") => ResourceType::Image,
-        Some(_) => ResourceType::Other,
-        None => classify_by_ext(url.path()),
-    };
 
-    let host = url.host_str().unwrap_or("");
-    let new_urls = match rtype {
+    let (new_urls, outlinks) = match rtype {
         ResourceType::Page => {
-            let html_str = String::from_utf8_lossy(&body);
-            let doc = Html::parse_document(&html_str);
-            extract_urls(&doc, url, host)
+            if let Some(stored) = prior.outlinks.as_ref() {
+                let links: Vec<Url> = stored.iter().filter_map(|s| Url::parse(s).ok()).collect();
+                return Ok(ProcessResult {
+                    rtype,
+                    url: canonical.as_str().to_string(),
+                    original_url: url.as_str().to_string(),
+                    save_path: save_path_rel,
+                    new_urls: links.clone(),
+                    outlinks: stored.clone(),
+                    bytes: body,
+                    mtime: prior.mtime.clone(),
+                    etag: prior.etag.clone(),
+                    not_modified: true,
+                });
+            }
+            (Vec::new(), Vec::new())
         }
         ResourceType::Css => {
             let css_str = String::from_utf8_lossy(&body);
-            extract_css_urls(&css_str, url, host)
+            (
+                extract_css_urls(&css_str, url, base_host, base_port),
+                Vec::new(),
+            )
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
 
-    let norm = normalize_url(url);
     Ok(ProcessResult {
         rtype,
-        url: norm.as_str().to_string(),
+        url: canonical.as_str().to_string(),
+        original_url: url.as_str().to_string(),
         save_path: save_path_rel,
         new_urls,
+        outlinks,
         bytes: body,
         mtime: prior.mtime.clone(),
         etag: prior.etag.clone(),
@@ -329,20 +409,32 @@ pub(crate) async fn process_one(
     client: &Client,
     url: &Url,
     output_base: &str,
+    base_host: &str,
+    base_port: Option<u16>,
     pb: &ProgressBar,
     prior: Option<PriorState>,
 ) -> Result<ProcessResult> {
     pb.set_message(format!("Fetching {}", url.path()));
 
-    let save_path = url_to_path(url, output_base);
+    let provisional_rtype = prior
+        .as_ref()
+        .and_then(|p| p.rtype.as_deref())
+        .map(|r| match r {
+            "page" => ResourceType::Page,
+            "css" => ResourceType::Css,
+            "js" => ResourceType::Js,
+            "image" => ResourceType::Image,
+            _ => ResourceType::Other,
+        })
+        .unwrap_or_else(|| classify_by_ext(url.path()));
+
+    let save_path = url_to_path(url, output_base, base_host, base_port, provisional_rtype);
     let file_exists = save_path.exists();
 
-    // Local hash match and no validators → reuse without network.
-    // If validators exist, prefer conditional GET to detect remote changes.
     if let Some(ref p) = prior {
         let has_validators = p.etag.is_some() || p.mtime.is_some();
         if p.local_fresh && file_exists && !has_validators {
-            return reuse_local(url, output_base, p).await;
+            return reuse_local(url, output_base, base_host, base_port, p).await;
         }
     }
 
@@ -351,7 +443,7 @@ pub(crate) async fn process_one(
 
     if response.status() == StatusCode::NOT_MODIFIED {
         if let Some(ref p) = prior {
-            return reuse_local(url, output_base, p).await;
+            return reuse_local(url, output_base, base_host, base_port, p).await;
         }
         anyhow::bail!("HTTP 304 for {} but no local entry", url);
     }
@@ -390,41 +482,55 @@ pub(crate) async fn process_one(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // For pages and CSS, rewrite links and extract sub-resources.
-    // Manifest hashes the final on-disk bytes (rewritten when applicable).
-    let (new_urls, written) = match rtype {
+    let (new_urls, outlinks, written) = match rtype {
         ResourceType::Page => {
             let html_str = String::from_utf8_lossy(&body);
-            let rewritten = rewriter::rewrite_html(&html_str, url);
+            let rewritten = rewriter::rewrite_html(&html_str, url, base_host, base_port);
             let written = rewritten.into_bytes();
             tokio::fs::write(&save_path, &written).await?;
 
             let doc = Html::parse_document(&html_str);
-            let host = url.host_str().unwrap_or("");
-            (extract_urls(&doc, url, host), written)
+            let assets = extract_urls(&doc, url, base_host, base_port);
+            let pages = extract_page_links(&doc, url, base_host);
+            let outlinks: Vec<String> = pages
+                .iter()
+                .map(|u| {
+                    canonical_url(u, base_host, ResourceType::Page)
+                        .as_str()
+                        .to_string()
+                })
+                .collect();
+            let mut discovered = assets;
+            discovered.extend(pages);
+            (discovered, outlinks, written)
         }
         ResourceType::Css => {
             let css_str = String::from_utf8_lossy(&body);
-            let rewritten = rewriter::rewrite_css(&css_str, url);
+            let rewritten = rewriter::rewrite_css(&css_str, url, base_host, base_port);
             let written = rewritten.into_bytes();
             tokio::fs::write(&save_path, &written).await?;
 
-            let host = url.host_str().unwrap_or("");
-            (extract_css_urls(&css_str, url, host), written)
+            (
+                extract_css_urls(&css_str, url, base_host, base_port),
+                Vec::new(),
+                written,
+            )
         }
         _ => {
             let written = body.to_vec();
             tokio::fs::write(&save_path, &written).await?;
-            (Vec::new(), written)
+            (Vec::new(), Vec::new(), written)
         }
     };
 
-    let norm = normalize_url(url);
+    let canonical = canonical_url(url, base_host, rtype);
     Ok(ProcessResult {
         rtype,
-        url: norm.as_str().to_string(),
+        url: canonical.as_str().to_string(),
+        original_url: url.as_str().to_string(),
         save_path: save_path_rel,
         new_urls,
+        outlinks,
         bytes: written,
         mtime,
         etag,
@@ -501,7 +607,12 @@ async fn fetch_with_retry(
 }
 
 /// Extract same-domain sub-resource URLs from CSS content (url(), @import).
-pub(crate) fn extract_css_urls(css: &str, css_url: &Url, base_host: &str) -> Vec<Url> {
+pub(crate) fn extract_css_urls(
+    css: &str,
+    css_url: &Url,
+    base_host: &str,
+    base_port: Option<u16>,
+) -> Vec<Url> {
     let mut urls = Vec::new();
 
     if let Ok(re) = regex::Regex::new(r#"url\(\s*['"]?([^'")]+)['"]?\s*\)"#) {
@@ -511,7 +622,9 @@ pub(crate) fn extract_css_urls(css: &str, css_url: &Url, base_host: &str) -> Vec
                 continue;
             }
             if let Some(abs_url) = resolve_url(css_url, url_text) {
-                if is_same_domain(&abs_url, base_host) {
+                if pathmap::is_mirrorable_static(&abs_url, base_host, base_port)
+                    && !pathmap::is_dynamic_request(&abs_url)
+                {
                     urls.push(abs_url);
                 }
             }
@@ -522,7 +635,9 @@ pub(crate) fn extract_css_urls(css: &str, css_url: &Url, base_host: &str) -> Vec
         for cap in re.captures_iter(css) {
             let url_text = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             if let Some(abs_url) = resolve_url(css_url, url_text) {
-                if is_same_domain(&abs_url, base_host) {
+                if pathmap::is_mirrorable_static(&abs_url, base_host, base_port)
+                    && !pathmap::is_dynamic_request(&abs_url)
+                {
                     urls.push(abs_url);
                 }
             }
@@ -614,9 +729,15 @@ impl RobotsChecker {
 
 /// True when an intercepted network URL is the HTML document itself
 /// (should not be re-downloaded as an asset after SPA render).
-pub(crate) fn is_spa_document_url(asset: &Url, page_url: &Url, final_url: &Url) -> bool {
-    let a = normalize_url(asset);
-    a == normalize_url(page_url) || a == normalize_url(final_url)
+pub(crate) fn is_spa_document_url(
+    asset: &Url,
+    page_url: &Url,
+    final_url: &Url,
+    base_host: &str,
+) -> bool {
+    let a = normalize_url(asset, base_host, ResourceType::Page);
+    a == normalize_url(page_url, base_host, ResourceType::Page)
+        || a == normalize_url(final_url, base_host, ResourceType::Page)
 }
 
 #[cfg(test)]
@@ -631,9 +752,19 @@ mod robots_tests {
         let doc_slash = Url::parse("https://example.com/app/").unwrap();
         let asset = Url::parse("https://example.com/app.js").unwrap();
 
-        assert!(is_spa_document_url(&doc, &page, &final_url));
-        assert!(is_spa_document_url(&doc_slash, &page, &final_url));
-        assert!(!is_spa_document_url(&asset, &page, &final_url));
+        assert!(is_spa_document_url(&doc, &page, &final_url, "example.com"));
+        assert!(is_spa_document_url(
+            &doc_slash,
+            &page,
+            &final_url,
+            "example.com"
+        ));
+        assert!(!is_spa_document_url(
+            &asset,
+            &page,
+            &final_url,
+            "example.com"
+        ));
     }
 
     #[test]
@@ -715,6 +846,7 @@ fn analyze_spa_html(html: &str) -> bool {
     // --- Strong framework signals ---
     let strong_markers = [
         "__next_data__",
+        "__next_f",
         "__nuxt__",
         "ng-version",
         "data-reactroot",
@@ -772,6 +904,70 @@ fn analyze_spa_html(html: &str) -> bool {
     false
 }
 
+fn normalize_discovered(url: &Url, base_host: &str) -> Url {
+    let rtype = classify_by_ext(url.path());
+    normalize_url(url, base_host, rtype)
+}
+
+fn record_process_result(mf: &mut Manifest, pr: &ProcessResult) {
+    let rtype_str = rtype_to_str(pr.rtype);
+    let original = if pr.original_url == pr.url {
+        None
+    } else {
+        Some(pr.original_url.clone())
+    };
+    mf.record_with_meta(
+        pr.url.clone(),
+        original,
+        pr.save_path.clone(),
+        &pr.bytes,
+        pr.mtime.clone(),
+        pr.etag.clone(),
+        rtype_str,
+        &pr.outlinks,
+    );
+}
+
+fn finalize_stats(mut stats: Stats, manifest_saved: bool) -> Stats {
+    stats.outcome = if stats.pages == 0 && stats.errors > 0 {
+        CrawlOutcome::Failed
+    } else if stats.errors > 0 || !manifest_saved {
+        CrawlOutcome::Partial
+    } else {
+        CrawlOutcome::Complete
+    };
+    stats
+}
+
+fn print_crawl_summary(stats: &Stats, spa: bool) {
+    println!();
+    if spa {
+        println!("📄 Pages rendered: {}", stats.pages);
+    } else {
+        println!("📄 Pages: {}", stats.pages);
+    }
+    println!("🖼  Images: {}", stats.images);
+    println!("🎨 CSS: {}", stats.css);
+    println!("📦 JS: {}", stats.js);
+    println!("📁 Size: {}", format_bytes(stats.total_bytes));
+    if stats.errors > 0 {
+        println!("⚠  Errors: {}", stats.errors);
+    }
+    println!();
+    if spa {
+        println!("✓ SPA render completed");
+    } else {
+        println!("✓ Mirror completed");
+    }
+    match stats.outcome {
+        CrawlOutcome::Complete => println!("✓ Offline ready"),
+        CrawlOutcome::Partial => {
+            println!("⚠ Mirror incomplete — some resources failed or manifest was not saved")
+        }
+        CrawlOutcome::Failed => println!("✗ Mirror failed"),
+    }
+}
+
 /// Build conditional/local reuse state from an existing manifest entry.
 fn prior_from_manifest(mf: &Manifest, url: &str, output_dir: &str) -> Option<PriorState> {
     let entry = mf.entry(url)?;
@@ -781,6 +977,11 @@ fn prior_from_manifest(mf: &Manifest, url: &str, output_dir: &str) -> Option<Pri
         local_fresh: mf.is_fresh(url, output_dir),
         rtype: Some(entry.rtype.clone()),
         rel_path: Some(entry.path.clone()),
+        outlinks: if entry.outlinks.is_empty() {
+            None
+        } else {
+            Some(entry.outlinks.clone())
+        },
     })
 }
 
@@ -806,7 +1007,13 @@ pub async fn crawl(
     // the manifest, or incremental runs would skip link rediscovery.
     let visited = Arc::new(Mutex::new(HashSet::new()));
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-    let seed = normalize_url(url);
+    let base_host = url.host_str().unwrap_or("").to_string();
+    let host_norm = base_host
+        .strip_prefix("www.")
+        .unwrap_or(&base_host)
+        .to_string();
+    let base_port = url.port();
+    let seed = normalize_url(url, &host_norm, ResourceType::Page);
     let out_dir = output_dir.to_string();
 
     // Fetch robots.txt if requested
@@ -855,9 +1062,11 @@ pub async fn crawl(
     let s1 = Arc::clone(&stats);
     let pb1 = Arc::clone(&pb);
     let o1 = out_dir.clone();
+    let h1 = host_norm.clone();
+    let bp1 = base_port;
     set.spawn(async move {
         let _permit = permit;
-        let res = process_one(&c1, &seed, &o1, &pb1, seed_prior).await;
+        let res = process_one(&c1, &seed, &o1, &h1, bp1, &pb1, seed_prior).await;
         match res {
             Ok(pr) => {
                 if !pr.not_modified {
@@ -881,15 +1090,7 @@ pub async fn crawl(
                 // Record in manifest (hash of final on-disk bytes)
                 if let Some(ref mf) = manifest {
                     let mut mf = mf.lock().await;
-                    let rtype_str = rtype_to_str(pr.rtype);
-                    mf.record(
-                        pr.url,
-                        pr.save_path,
-                        &pr.bytes,
-                        pr.mtime,
-                        pr.etag,
-                        rtype_str,
-                    );
+                    record_process_result(&mut mf, &pr);
                 }
 
                 for new_url in pr.new_urls {
@@ -901,7 +1102,7 @@ pub async fn crawl(
                         break;
                     }
 
-                    let norm = normalize_url(&new_url);
+                    let norm = normalize_discovered(&new_url, &host_norm);
                     let is_new = {
                         let mut v = visited.lock().await;
                         v.insert(norm.clone())
@@ -930,9 +1131,11 @@ pub async fn crawl(
                     let s = Arc::clone(&stats);
                     let p = Arc::clone(&pb);
                     let o = out_dir.clone();
+                    let h = host_norm.clone();
+                    let bp = base_port;
                     set.spawn(async move {
                         let _permit = permit;
-                        let res = process_one(&c, &new_url, &o, &p, prior).await;
+                        let res = process_one(&c, &new_url, &o, &h, bp, &p, prior).await;
                         match res {
                             Ok(pr) => {
                                 if !pr.not_modified {
@@ -966,28 +1169,17 @@ pub async fn crawl(
     };
 
     // Save manifest with visited URLs
+    let mut manifest_saved = manifest.is_none();
     if let Some(ref mf) = manifest {
         let mut mf = mf.lock().await;
         for url in &visited_urls {
             mf.visited.insert(url.clone());
         }
-        let _ = mf.save_to(&out_dir);
+        manifest_saved = mf.save_to(&out_dir).is_ok();
     }
 
-    let s = stats.load();
-    println!();
-    println!("📄 Pages: {}", s.pages);
-    println!("🖼  Images: {}", s.images);
-    println!("🎨 CSS: {}", s.css);
-    println!("📦 JS: {}", s.js);
-    println!("📁 Size: {}", format_bytes(s.total_bytes));
-    if s.errors > 0 {
-        println!("⚠  Errors: {}", s.errors);
-    }
-    println!();
-    println!("✓ Mirror completed");
-    println!("✓ Offline ready");
-
+    let s = finalize_stats(stats.load(), manifest_saved);
+    print_crawl_summary(&s, false);
     Ok(s)
 }
 
@@ -1044,6 +1236,7 @@ impl AtomicStats {
             js: self.js.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            outcome: CrawlOutcome::Complete,
         }
     }
 }
@@ -1087,6 +1280,7 @@ mod spa {
         let stats = Arc::new(AtomicStats::default());
         let out_dir = output_dir.to_string();
         let base_host = url.host_str().unwrap_or("").to_string();
+        let base_port = url.port();
         let host_norm = base_host
             .strip_prefix("www.")
             .unwrap_or(&base_host)
@@ -1127,7 +1321,7 @@ mod spa {
         let mut done_assets: HashSet<Url> = HashSet::new();
 
         let mut queue: VecDeque<Url> = VecDeque::new();
-        let seed = normalize_url(url);
+        let seed = normalize_url(url, &host_norm, ResourceType::Page);
         visited.insert(seed.clone());
         queue.push_back(seed);
 
@@ -1160,17 +1354,14 @@ mod spa {
             };
             if let Some(ref p) = page_prior {
                 if p.local_fresh {
-                    if let Ok(pr) = reuse_local(&route, &out_dir, p).await {
+                    if let Ok(pr) = reuse_local(&route, &out_dir, &host_norm, base_port, p).await {
                         stats.record(ResourceType::Page, 0);
                         for link in pr.new_urls {
-                            let norm = normalize_url(&link);
-                            if visited.insert(norm.clone()) {
-                                let path = norm.path().to_lowercase();
-                                let last_seg = path.rsplit('/').next().unwrap_or("");
-                                let has_ext = last_seg.contains('.');
-                                if !has_ext || path.ends_with(".html") || path.ends_with(".htm") {
-                                    queue.push_back(norm);
-                                }
+                            let norm = normalize_url(&link, &host_norm, ResourceType::Page);
+                            if visited.insert(norm.clone())
+                                && is_enqueueable_page(&norm, &host_norm)
+                            {
+                                queue.push_back(norm);
                             }
                         }
                         continue;
@@ -1179,23 +1370,32 @@ mod spa {
             }
 
             pb.set_message(format!("Rendering {}", route));
-            let render = match renderer::render_page(&browser, &route, &host_norm, wait_ms).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("  ⚠ render failed for {route}: {e}");
-                    stats.record_err();
-                    continue;
-                }
-            };
+            let render =
+                match renderer::render_page(&browser, &route, &host_norm, base_port, wait_ms).await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  ⚠ render failed for {route}: {e}");
+                        stats.record_err();
+                        continue;
+                    }
+                };
 
             // --- Save the rendered HTML ---
             let page_url = &render.final_url;
             // Strip <script> tags so the framework doesn't re-hydrate and
             // wipe the DOM when API calls fail offline.
             let stripped = crate::rewriter::strip_scripts(&render.html);
-            let rewritten = crate::rewriter::rewrite_html(&stripped, page_url);
+            let rewritten =
+                crate::rewriter::rewrite_html(&stripped, page_url, &host_norm, base_port);
 
-            let save_path = url_to_path(page_url, &out_dir);
+            let save_path = url_to_path(
+                page_url,
+                &out_dir,
+                &host_norm,
+                base_port,
+                ResourceType::Page,
+            );
             let save_path_rel = save_path
                 .strip_prefix(&out_dir)
                 .unwrap_or(&save_path)
@@ -1209,46 +1409,52 @@ mod spa {
                 }
             }
             let html_bytes = rewritten.into_bytes();
+            let page_outlinks: Vec<String> = render
+                .links
+                .iter()
+                .map(|u| {
+                    normalize_url(u, &host_norm, ResourceType::Page)
+                        .as_str()
+                        .to_string()
+                })
+                .collect();
             if let Err(e) = tokio::fs::write(&save_path, &html_bytes).await {
                 eprintln!("  ⚠ write failed for {}: {e}", save_path.display());
                 stats.record_err();
             } else {
                 stats.record(ResourceType::Page, html_bytes.len() as u64);
 
-                // Record in manifest.
                 if let Some(ref mf) = manifest {
                     let mut mf = mf.lock().await;
-                    let norm = normalize_url(page_url);
-                    mf.record(
+                    let norm = normalize_url(page_url, &host_norm, ResourceType::Page);
+                    mf.record_with_meta(
                         norm.as_str().to_string(),
+                        if page_url.as_str() != norm.as_str() {
+                            Some(page_url.as_str().to_string())
+                        } else {
+                            None
+                        },
                         save_path_rel.clone(),
                         &html_bytes,
                         None,
                         None,
                         "page",
+                        &page_outlinks,
                     );
                 }
             }
 
-            // --- Download all assets the browser requested ---
             let mut assets: Vec<Url> = Vec::new();
-            for asset_url in &render.resource_urls {
-                let norm = normalize_url(asset_url);
+            for cap in &render.resources {
+                let asset_url = &cap.url;
+                let asset_rtype = classify_by_ext(asset_url.path());
+                let norm = normalize_url(asset_url, &host_norm, asset_rtype);
 
-                // Never re-download the document URL — it would overwrite the
-                // rendered HTML with the raw SPA shell.
-                if is_spa_document_url(&norm, &route, page_url) {
+                if is_spa_document_url(&norm, &route, page_url, &host_norm) {
                     continue;
                 }
 
-                // Skip CDN-internal and analytics endpoints that can't be
-                // meaningfully downloaded (Cloudflare RUM, ___cflb, etc.).
-                let path = norm.path();
-                if path.starts_with("/cdn-cgi/")
-                    || path.contains("/__cf_")
-                    || path.ends_with("/rum")
-                    || path.contains("cloudflareinsights")
-                {
+                if pathmap::is_dynamic_request(&norm) {
                     continue;
                 }
 
@@ -1257,61 +1463,44 @@ mod spa {
                 }
             }
 
-            // Download assets concurrently.
             download_assets(
-                &assets, &client, &out_dir, &pb, &stats, &semaphore, &manifest,
+                &assets, &client, &out_dir, &host_norm, base_port, &pb, &stats, &semaphore,
+                &manifest,
             )
             .await;
 
-            // --- Enqueue new internal links ---
             for link in &render.links {
-                let norm = normalize_url(link);
-                if visited.insert(norm.clone()) {
-                    // Only enqueue paths that look like routes (not static assets).
-                    let path = norm.path().to_lowercase();
-                    let last_seg = path.rsplit('/').next().unwrap_or("");
-                    let has_ext = last_seg.contains('.');
-                    if !has_ext || path.ends_with(".html") || path.ends_with(".htm") {
-                        queue.push_back(norm);
-                    }
+                let norm = normalize_url(link, &host_norm, ResourceType::Page);
+                if visited.insert(norm.clone()) && is_enqueueable_page(&norm, &host_norm) {
+                    queue.push_back(norm);
                 }
             }
         }
 
-        // Persist manifest.
+        let mut manifest_saved = manifest.is_none();
         if let Some(ref mf) = manifest {
             let mut mf = mf.lock().await;
             for u in &visited {
                 let s = u.to_string();
                 mf.visited.insert(s);
             }
-            let _ = mf.save_to(&out_dir);
+            manifest_saved = mf.save_to(&out_dir).is_ok();
         }
 
         drop(browser);
 
-        let s = stats.load();
-        println!();
-        println!("📄 Pages rendered: {}", s.pages);
-        println!("🖼  Images: {}", s.images);
-        println!("🎨 CSS: {}", s.css);
-        println!("📦 JS: {}", s.js);
-        println!("📁 Size: {}", format_bytes(s.total_bytes));
-        if s.errors > 0 {
-            println!("⚠  Errors: {}", s.errors);
-        }
-        println!();
-        println!("✓ SPA render completed");
-        println!("✓ Offline ready");
-
+        let s = finalize_stats(stats.load(), manifest_saved);
+        print_crawl_summary(&s, true);
         Ok(s)
     }
 
-    /// Download a batch of asset URLs concurrently using process_one.
+    #[allow(clippy::too_many_arguments)]
     async fn download_assets(
         urls: &[Url],
         client: &Arc<Client>,
         out_dir: &str,
+        base_host: &str,
+        base_port: Option<u16>,
         pb: &Arc<ProgressBar>,
         stats: &Arc<AtomicStats>,
         semaphore: &Arc<Semaphore>,
@@ -1331,10 +1520,12 @@ mod spa {
             let p = Arc::clone(pb);
             let url = url.clone();
             let o = out_dir.to_string();
+            let h = base_host.to_string();
+            let bp = base_port;
 
             set.spawn(async move {
                 let _permit = permit;
-                process_one(&c, &url, &o, &p, prior).await
+                process_one(&c, &url, &o, &h, bp, &p, prior).await
             });
         }
 
@@ -1348,15 +1539,7 @@ mod spa {
                     }
                     if let Some(mf) = manifest {
                         let mut mf = mf.lock().await;
-                        let rtype_str = rtype_to_str(pr.rtype);
-                        mf.record(
-                            pr.url,
-                            pr.save_path,
-                            &pr.bytes,
-                            pr.mtime,
-                            pr.etag,
-                            rtype_str,
-                        );
+                        record_process_result(&mut mf, &pr);
                     }
                 }
                 Ok(Err(e)) => {
@@ -1374,6 +1557,22 @@ mod spa {
 
 #[cfg(feature = "render")]
 pub use spa::crawl_spa;
+
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+    use scraper::Html;
+
+    #[test]
+    fn extract_urls_includes_cross_port_asset() {
+        let page = Url::parse("http://127.0.0.1:1111/").unwrap();
+        let html = r#"<html><head><link rel="stylesheet" href="http://127.0.0.1:2222/roboto.woff2"></head></html>"#;
+        let doc = Html::parse_document(html);
+        let urls = extract_urls(&doc, &page, "127.0.0.1", Some(1111));
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].path().ends_with("roboto.woff2"));
+    }
+}
 
 #[cfg(test)]
 mod e2e_tests {
@@ -1493,6 +1692,64 @@ mod e2e_tests {
         assert!(
             second_hits > first_hits,
             "expected a revalidation request on incremental run"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_cross_port_asset_is_downloaded() {
+        let site = MockServer::start().await;
+        let cdn = MockServer::start().await;
+        let site_base = site.uri();
+        let cdn_base = cdn.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!(
+                        r#"<html><head><link rel="stylesheet" href="{cdn_base}/roboto.woff2"></head><body>Hi</body></html>"#
+                    )),
+            )
+            .mount(&site)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/roboto.woff2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "font/woff2")
+                    .set_body_bytes(b"wOF2"),
+            )
+            .mount(&cdn)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().to_str().unwrap();
+        let start = Url::parse(&format!("{site_base}/")).unwrap();
+        let mf = tokio::sync::Mutex::new(Manifest::new(start.as_str()));
+
+        let stats = crawl(&start, out, 2, Some(mf), false, CrawlLimits::default())
+            .await
+            .unwrap();
+
+        let cdn_url = Url::parse(&format!("{cdn_base}/roboto.woff2")).unwrap();
+        let cdn_host = cdn_url.host_str().unwrap();
+        let cdn_port = cdn_url.port().unwrap();
+        let external = dir
+            .path()
+            .join(format!("_external/{cdn_host}_{cdn_port}/roboto.woff2"));
+
+        assert!(
+            external.exists(),
+            "expected external asset at {}, manifest entries: {:?}, bytes={}",
+            external.display(),
+            Manifest::load_from(out).unwrap().map(|m| m
+                .entries
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()),
+            stats.total_bytes
         );
     }
 }

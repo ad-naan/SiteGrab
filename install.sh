@@ -61,7 +61,9 @@ download_and_install() {
     local version="$1"
     local platform="$2"
     local os arch
-    os="${platform%_*}"
+    # NB: arch itself contains "_" (e.g. x86_64), so split on the FIRST "_"
+    # only — os is always "linux"/"macos" with no underscore.
+    os="${platform%%_*}"
     arch="${platform#*_}"
     local archive_url="https://github.com/${REPO}/releases/download/${version}/${BIN_NAME}-${os}-${arch}.tar.gz"
     local archive_name="${BIN_NAME}-${os}-${arch}.tar.gz"

@@ -16,7 +16,7 @@ sitegrab https://example.com
 ✓ Zip exported: example.com.zip
 ```
 
-Concurrently downloads HTML, CSS, JS, and images. **Auto-detects SPAs** (React, Vue, Angular, etc.) and renders them with a headless browser so client-side content is fully captured. Converts absolute links to relative paths for offline browsing. Automatically strips PWA artifacts (manifests, service workers, `crossorigin` attributes) that break `file://` access. Automatically exports a ZIP archive. **Incremental** — re-run to only download changed files.
+Concurrently downloads HTML, CSS, JS, images, fonts, and media. **Auto-detects SPAs** (React, Vue, Angular, etc.) and can render them with a headless browser. Browser requests are classified by resource type, so static assets are mirrored while Next.js RSC, Fetch/XHR, API, analytics, and WebSocket traffic are excluded. Same-origin and cross-origin static links are rewritten for offline browsing. Automatically exports a ZIP archive. **Incremental** — re-run to only download changed files.
 
 ---
 
@@ -80,7 +80,12 @@ Creates `example.com/` directory with mirrored content + `example.com.zip`.
 `sitegrab` automatically detects whether a site is a client-rendered SPA
 (React, Vue, Angular, SvelteKit, etc.) by checking framework markers and
 content heuristics. When detected, it falls back to headless-browser
-rendering so all dynamically loaded content is captured.
+rendering and saves the rendered DOM.
+
+The renderer records typed browser resources rather than treating every
+network request as a page. Documents, stylesheets, scripts, images, fonts,
+media, and manifests are eligible for mirroring; RSC (`?_rsc=`), Fetch/XHR,
+API, analytics, EventSource, and WebSocket requests are ignored.
 
 ```bash
 # Default — auto-detect and render SPAs
@@ -110,7 +115,7 @@ sitegrab https://example.com
 sitegrab --fresh https://example.com
 ```
 
-Rerunning the same URL re-crawls from the seed URL. Unchanged files are skipped via conditional requests (`ETag` / `Last-Modified`) when available, otherwise by comparing SHA-256 of the on-disk (rewritten) content stored in `<output-dir>/.sitegrab.json`.
+Rerunning the same URL re-crawls from the seed URL. Unchanged files are skipped via conditional requests (`ETag` / `Last-Modified`) when available, otherwise by comparing SHA-256 of the on-disk (rewritten) content stored in `<output-dir>/.sitegrab.json`. The manifest also stores canonical URL identity, original URLs, resource types, final paths, and page outlinks, so incremental discovery does not need to reverse-engineer already rewritten HTML.
 
 ### Custom output
 
@@ -130,10 +135,18 @@ example.com/
 ├── blog/post-1/index.html
 ├── css/style.css
 ├── js/app.js
-└── images/logo.png
+├── images/logo.png
+└── _external/
+    ├── fonts.googleapis.com/css2@family=Roboto/index.html
+    └── fonts.gstatic.com/s/roboto.woff2
 
 example.com.zip      # ← auto-generated
 ```
+
+Page URLs remove fragments, Next.js `_rsc`, and common tracking parameters
+such as `ref`, `utm_*`, `gclid`, and `fbclid`. Semantic query parameters are
+preserved and sorted. Asset queries are preserved for cache-busting, with
+long queries shortened using a stable hash.
 
 Links are rewritten for offline browsing:
 
@@ -141,8 +154,12 @@ Links are rewritten for offline browsing:
 |---|---|
 | `<a href="/about">` | `<a href="about/index.html">` |
 | `<img src="/images/logo.png">` | `<img src="images/logo.png">` |
+| `<link href="https://fonts.example/font.css">` | `<link href="_external/fonts.example/font.css">` |
 | `<a href="https://other.com">` | unchanged (external) |
 | `<a href="#section">` | unchanged (anchor) |
+
+Cross-origin static resources are stored under `_external/<host>/...`.
+External HTML navigation remains unchanged and is not recursively crawled.
 
 ---
 
@@ -156,9 +173,12 @@ sitegrab <URL>
     │   ├── SPA? → headless browser render → save HTML
     │   └── otherwise → plain HTTP fetch → parse/rewrite → save
     │
-    ├── CSS/JS/IMG → download → save
-    ├── Hash → record in manifest (incremental)
+    ├── Typed resources → filter dynamic requests → download static assets
+    ├── URL canonicalization → deduplicate pages/assets
+    ├── Cross-origin assets → _external/<host>/...
+    ├── Manifest → canonical URL + original URL + type + path + outlinks
     ├── Strip offline-breakers — manifest links, SW scripts, crossorigin
+    ├── Offline closure check — verify rewritten local references exist
     │
     ├── Summary — pages, images, CSS, JS, size
     │
@@ -166,14 +186,16 @@ sitegrab <URL>
 ```
 
 - **Language:** Rust — single static binary for HTTP crawl mode
-- **SPA detection:** checks `__NEXT_DATA__`, `ng-version`, `__nuxt__` and more; falls back to heuristics (empty `<body>` + `#root`/`#app` div)
+- **SPA detection:** checks `__NEXT_DATA__`, `__next_f`, `ng-version`, `__nuxt__` and more; falls back to heuristics (empty `<body>` + `#root`/`#app` div)
 - **Rendering:** `chromiumoxide` headless Chrome/Chromium/Edge (default feature; requires a local browser, or use `--render off`)
+- **Resource filtering:** CDP resource types separate static assets from RSC, Fetch/XHR, APIs, analytics, and WebSockets
 - **Concurrency:** `tokio` `JoinSet` + bounded `Semaphore` (default 8 workers)
 - **Compression:** gzip / brotli / deflate decoding for smaller transfers
 - **HTML parsing:** `scraper` (CSS selectors for `<a>`, `<img>`, `<link>`, `<script>`)
-- **Link rewriting:** regex-based attribute replacement (double/single quotes, `data-src`), strips `<base>`, skips anchors/javascript/mailto/external
-- **Incremental:** conditional GET (`ETag` / `Last-Modified`) plus SHA-256 of on-disk rewritten bytes in `.sitegrab.json`
+- **Link rewriting:** HTML, CSS `url()` / `@import`, `srcset`, fonts, poster, and lazy-load attributes share the same path mapping
+- **Incremental:** conditional GET plus SHA-256 and manifest-backed dependency recovery
 - **Offline safety:** strips PWA manifests, service workers, modulepreload/script preloads, and `crossorigin` attributes for `file://` compatibility
+- **Completion status:** `complete`, `partial`, or `failed`; incomplete mirrors return a non-zero exit code
 - **ZIP:** `zip` crate with deflate compression
 
 ---
@@ -186,6 +208,17 @@ sitegrab <URL>
 - **`--no-sandbox`** disables Chromium's sandbox — only use in trusted containers.
 - **Interactive / behind-login content** not captured (no auth flow).
 - **SPA offline pages** strip `<script>` tags so frameworks don't wipe the rendered DOM without APIs.
+- **Dynamic APIs are intentionally not mirrored.** The offline result is a static snapshot, not a working backend.
+- **External HTML pages are not recursively crawled.** Only referenced static assets are stored under `_external/`.
+
+### Completion status
+
+- **Complete** — crawl and manifest save succeeded; prints `Offline ready`.
+- **Partial** — one or more resources failed, or the manifest could not be saved; exits with code `2`.
+- **Failed** — no usable mirror was produced; exits with code `1`.
+
+Missing local references are reported by the offline closure check instead of
+silently claiming the mirror is ready.
 
 ---
 
@@ -205,17 +238,30 @@ sitegrab <URL>
 ## Development
 
 ```bash
-cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo test --no-default-features
 ```
 
 ### Local testing
 
 ```bash
-cargo build --release
+cargo build --release --all-features
 ./target/release/sitegrab https://example.com
 ```
 
 Creates `example.com/` and `example.com.zip` in the current directory. Open `example.com/index.html` to verify offline browsing.
+
+To exercise browser rendering and Next.js/RSC filtering:
+
+```bash
+./target/release/sitegrab "https://canopyseo.com/?ref=onepagelove" --render on
+```
+
+The output should not contain `_rsc` directories or a duplicate
+`@ref=onepagelove` homepage. Referenced CDN assets such as Google Fonts should
+appear under `canopyseo.com/_external/`.
 
 License: MIT
 

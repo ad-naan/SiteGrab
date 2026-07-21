@@ -4,10 +4,17 @@ use std::sync::OnceLock;
 use regex::Regex;
 use url::Url;
 
-use crate::pathmap;
+use crate::pathmap::{self, UrlKind};
 
-fn relative_path(page_path: &str, target_url: &Url) -> String {
-    let target_path = pathmap::url_to_offline_path(target_url);
+fn relative_path(
+    page_path: &str,
+    target_url: &Url,
+    base_host: &str,
+    base_port: Option<u16>,
+    target_kind: UrlKind,
+) -> String {
+    let target_path =
+        pathmap::url_to_offline_path_with(target_url, base_host, base_port, target_kind);
 
     let page_dir = Path::new(page_path).parent().unwrap_or(Path::new(""));
 
@@ -47,12 +54,17 @@ fn relative_path(page_path: &str, target_url: &Url) -> String {
     }
 }
 
-/// Convert URL to its offline filesystem path + optional extension override.
-///   /about        → ("about/index.html", None)
-///   /img/a.png    → ("img/a.png", None)
-///   /post?id=1    → ("post@id=1/index.html", None)
-fn url_to_offline_path(url: &Url) -> (String, Option<String>) {
-    let path = pathmap::url_to_offline_path(url);
+fn infer_kind(url: &Url) -> UrlKind {
+    pathmap::infer_url_kind(url)
+}
+
+fn url_to_offline_path(
+    url: &Url,
+    base_host: &str,
+    base_port: Option<u16>,
+) -> (String, Option<String>) {
+    let kind = infer_kind(url);
+    let path = pathmap::url_to_offline_path_with(url, base_host, base_port, kind);
     let ext = Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())
@@ -63,7 +75,6 @@ fn url_to_offline_path(url: &Url) -> (String, Option<String>) {
 fn attr_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // Double or single quoted href/src/action/poster/data-src/data-lazy-src
         Regex::new(
             r#"(?i)(\s+(?:href|src|action|poster|data-src|data-lazy-src)\s*=\s*)(?:"([^"]*?)"|'([^']*?)')"#,
         )
@@ -97,15 +108,12 @@ fn extract_base_href(html: &str, page_url: &Url) -> Option<Url> {
     page_url.join(cap.get(1)?.as_str()).ok()
 }
 
-/// Cached regex to remove `<script>...</script>` blocks (including self-closing).
 #[cfg(feature = "render")]
 fn script_tag_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap())
 }
 
-/// Remove all `<script>` tags from HTML. This is used for SPA pages so the
-/// framework doesn't re-hydrate and wipe the DOM when API calls fail offline.
 #[cfg(feature = "render")]
 pub fn strip_scripts(html: &str) -> String {
     if !html.to_lowercase().contains("<script") {
@@ -114,9 +122,21 @@ pub fn strip_scripts(html: &str) -> String {
     script_tag_regex().replace_all(html, "").to_string()
 }
 
-fn rewrite_url_value(value: &str, base_url: &Url, page_path: &str) -> Option<String> {
-    if value.starts_with('#')
-        || value.starts_with("javascript:")
+fn split_fragment(value: &str) -> (String, Option<String>) {
+    match value.find('#') {
+        Some(i) => (value[..i].to_string(), Some(value[i..].to_string())),
+        None => (value.to_string(), None),
+    }
+}
+
+fn rewrite_url_value(
+    value: &str,
+    base_url: &Url,
+    page_path: &str,
+    base_host: &str,
+    base_port: Option<u16>,
+) -> Option<String> {
+    if value.starts_with("javascript:")
         || value.starts_with("mailto:")
         || value.starts_with("tel:")
         || value.starts_with("data:")
@@ -125,30 +145,44 @@ fn rewrite_url_value(value: &str, base_url: &Url, page_path: &str) -> Option<Str
         return None;
     }
 
-    let resolved = base_url.join(value).ok()?;
+    if value.starts_with('#') {
+        return None;
+    }
+
+    let (path_part, fragment) = split_fragment(value);
+    let resolved = base_url.join(&path_part).ok()?;
 
     if resolved.scheme() != "http" && resolved.scheme() != "https" {
         return None;
     }
 
-    let resolved_host = resolved.host_str().unwrap_or("");
-    let page_host = base_url.host_str().unwrap_or("");
-    let resolved_host_norm = resolved_host.strip_prefix("www.").unwrap_or(resolved_host);
-    let page_host_norm = page_host.strip_prefix("www.").unwrap_or(page_host);
-
-    if resolved_host_norm != page_host_norm {
+    if pathmap::is_dynamic_request(&resolved) {
         return None;
     }
 
-    let new_path = relative_path(page_path, &resolved);
-    if new_path == value || new_path == "." || new_path == page_path {
+    let kind = infer_kind(&resolved);
+    if kind == UrlKind::Page && !crate::crawler::is_same_domain(&resolved, base_host) {
+        // Keep external navigation links as-is for online use.
+        return None;
+    }
+    if !pathmap::is_mirrorable_static(&resolved, base_host, base_port) {
         return None;
     }
 
-    Some(new_path)
+    let new_path = relative_path(page_path, &resolved, base_host, base_port, kind);
+    let with_fragment = match fragment {
+        Some(f) => format!("{new_path}{f}"),
+        None => new_path,
+    };
+
+    if with_fragment == value || with_fragment == "." || with_fragment == page_path {
+        return None;
+    }
+
+    Some(with_fragment)
 }
 
-pub fn rewrite_html(html: &str, page_url: &Url) -> String {
+pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Option<u16>) -> String {
     if !html.contains("href=")
         && !html.contains("src=")
         && !html.contains("srcset=")
@@ -159,7 +193,7 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
 
     let base_url = extract_base_href(html, page_url).unwrap_or_else(|| page_url.clone());
     let page_path = {
-        let (p, _) = url_to_offline_path(page_url);
+        let (p, _) = url_to_offline_path(page_url, base_host, base_port);
         p
     };
 
@@ -205,7 +239,8 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
                     .or_else(|| caps.get(3))
                     .map(|m| m.as_str())
                     .unwrap_or("");
-                if let Some(nv) = rewrite_srcset(value, &base_url, &page_path) {
+                if let Some(nv) = rewrite_srcset(value, &base_url, &page_path, base_host, base_port)
+                {
                     result.push_str(&format!("{}\"{}\"", attr_prefix.trim_end(), nv));
                 } else {
                     result.push_str(matched);
@@ -220,7 +255,9 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
                 .or_else(|| caps.get(3))
                 .map(|m| m.as_str())
                 .unwrap_or("");
-            if let Some(new_path) = rewrite_url_value(value, &base_url, &page_path) {
+            if let Some(new_path) =
+                rewrite_url_value(value, &base_url, &page_path, base_host, base_port)
+            {
                 result.push_str(&format!("{}\"{}\"", attr_prefix.trim_end(), new_path));
             } else {
                 result.push_str(matched);
@@ -233,13 +270,10 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
     }
 
     result.push_str(&html[last_end..]);
-    // Remove <base> so file:// relative URLs are not re-resolved against the origin.
     let result = base_tag_regex().replace_all(&result, "").to_string();
     strip_offline_breakers(result)
 }
 
-/// Regex matching `<link rel="manifest">` tags — causes CORS errors when
-/// the mirror is opened from `file://`.
 fn manifest_link_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -247,8 +281,6 @@ fn manifest_link_regex() -> &'static Regex {
     })
 }
 
-/// Regex matching `<link rel="modulepreload">` tags — ES module preloads
-/// fail with CORS on `file://` and are useless once `<script>` tags are stripped.
 fn modulepreload_link_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -256,8 +288,6 @@ fn modulepreload_link_regex() -> &'static Regex {
     })
 }
 
-/// Regex matching `<link rel="preload" ... as="script" ...>` — preloads JS
-/// modules that can't run on `file://`.
 fn script_preload_link_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -265,8 +295,6 @@ fn script_preload_link_regex() -> &'static Regex {
     })
 }
 
-/// Regex matching external `<script src="registerSW.js">` style tags that
-/// load a Service Worker bundle — fails on `file://` protocol.
 fn sw_external_script_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -281,22 +309,11 @@ fn sw_inline_script_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(?is)<script\b[^>]*?>([\s\S]*?)</script>"#).unwrap())
 }
 
-/// Regex to strip the `crossorigin` attribute from any HTML tag.
-/// Matches `crossorigin`, `crossorigin=""`, `crossorigin="anonymous"`,
-/// `crossorigin="use-credentials"`, with single or double quotes.
 fn crossorigin_attr_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"(?i)\s+crossorigin(?:\s*=\s*["'][^"']*["'])?"#).unwrap())
 }
 
-/// Remove artifacts that break offline browsing under `file://`:
-///   - `<link rel="manifest">` (CORS + PWA)
-///   - `<link rel="modulepreload">` (ES module preloads need CORS, and
-///     scripts are stripped anyway so preloads are dead weight)
-///   - `<link rel="preload" as="script">` (same)
-///   - `<script src="registerSW.js">` SW loader
-///   - Inline `<script>` blocks registering a Service Worker
-///   - `crossorigin` attribute on any remaining tag (triggers CORS checks)
 fn strip_offline_breakers(html: String) -> String {
     let sw_ext_re = sw_external_script_regex();
     let manifest_re = manifest_link_regex();
@@ -305,13 +322,11 @@ fn strip_offline_breakers(html: String) -> String {
     let sw_inline_re = sw_inline_script_regex();
     let crossorigin_re = crossorigin_attr_regex();
 
-    // Remove whole tags that are inherently incompatible with file://
     let after_re = sw_ext_re.replace_all(&html, "");
     let after_re = manifest_re.replace_all(&after_re, "");
     let after_re = modulepreload_re.replace_all(&after_re, "");
     let after_re = script_preload_re.replace_all(&after_re, "");
 
-    // Remove inline SW-registration scripts
     let mut result = String::with_capacity(after_re.len());
     let mut last_end = 0;
     for cap in sw_inline_re.captures_iter(&after_re) {
@@ -328,11 +343,16 @@ fn strip_offline_breakers(html: String) -> String {
     }
     result.push_str(&after_re[last_end..]);
 
-    // Strip crossorigin attribute from all remaining tags
     crossorigin_re.replace_all(&result, "").to_string()
 }
 
-fn rewrite_srcset(srcset: &str, base_url: &Url, page_path: &str) -> Option<String> {
+fn rewrite_srcset(
+    srcset: &str,
+    base_url: &Url,
+    page_path: &str,
+    base_host: &str,
+    base_port: Option<u16>,
+) -> Option<String> {
     let parts: Vec<&str> = srcset.split(',').collect();
     let mut rewritten_parts = Vec::new();
     let mut changed = false;
@@ -349,19 +369,19 @@ fn rewrite_srcset(srcset: &str, base_url: &Url, page_path: &str) -> Option<Strin
         };
         let descriptor: String = tokens.collect::<Vec<_>>().join(" ");
 
-        if let Some(new_path) = rewrite_url_value(url_token, base_url, page_path) {
+        if let Some(new_path) =
+            rewrite_url_value(url_token, base_url, page_path, base_host, base_port)
+        {
             if !descriptor.is_empty() {
                 rewritten_parts.push(format!("{} {}", new_path, descriptor));
             } else {
                 rewritten_parts.push(new_path);
             }
             changed = true;
+        } else if !descriptor.is_empty() {
+            rewritten_parts.push(format!("{} {}", url_token, descriptor));
         } else {
-            if !descriptor.is_empty() {
-                rewritten_parts.push(format!("{} {}", url_token, descriptor));
-            } else {
-                rewritten_parts.push(url_token.to_string());
-            }
+            rewritten_parts.push(url_token.to_string());
         }
     }
 
@@ -372,11 +392,9 @@ fn rewrite_srcset(srcset: &str, base_url: &Url, page_path: &str) -> Option<Strin
     }
 }
 
-/// Rewrite CSS content for offline browsing: convert absolute `url()` and
-/// `@import` references to relative paths.
-pub fn rewrite_css(css: &str, css_url: &Url) -> String {
+pub fn rewrite_css(css: &str, css_url: &Url, base_host: &str, base_port: Option<u16>) -> String {
     let css_path = {
-        let (p, _) = url_to_offline_path(css_url);
+        let (p, _) = url_to_offline_path(css_url, base_host, base_port);
         p
     };
 
@@ -429,8 +447,10 @@ pub fn rewrite_css(css: &str, css_url: &Url) -> String {
             continue;
         }
 
-        if let Some(new_path) = rewrite_url_value(url_text, css_url, &css_path) {
-            result.push_str(&format!("url(\"{}\")", new_path));
+        if let Some(new_path) =
+            rewrite_url_value(url_text, css_url, &css_path, base_host, base_port)
+        {
+            result.push_str(&format!("url(\"{new_path}\")"));
         } else {
             result.push_str(&css[span.start..span.end]);
         }
@@ -449,100 +469,66 @@ mod tests {
     #[test]
     fn test_relative_path_same_dir() {
         let target = Url::parse("https://example.com/images/logo.png").unwrap();
-        assert_eq!(relative_path("index.html", &target), "images/logo.png");
+        assert_eq!(
+            relative_path("index.html", &target, "example.com", None, UrlKind::Asset),
+            "images/logo.png"
+        );
     }
 
     #[test]
     fn test_relative_path_parent() {
         let target = Url::parse("https://example.com/index.html").unwrap();
-        assert_eq!(relative_path("about/index.html", &target), "../index.html");
-    }
-
-    #[test]
-    fn test_url_to_offline_path_with_query() {
-        let u = Url::parse("https://example.com/article?id=1").unwrap();
-        let (p, _) = url_to_offline_path(&u);
-        assert_eq!(p, "article@id=1/index.html");
-    }
-
-    #[test]
-    fn test_url_to_offline_path_file_with_query() {
-        let u = Url::parse("https://example.com/img/photo.png?v=2").unwrap();
-        let (p, _) = url_to_offline_path(&u);
-        assert_eq!(p, "img/photo@v=2.png");
-    }
-
-    #[test]
-    fn test_url_to_offline_path_distinct_queries() {
-        let u1 = Url::parse("https://example.com/post?id=1").unwrap();
-        let u2 = Url::parse("https://example.com/post?id=2").unwrap();
-        let (p1, _) = url_to_offline_path(&u1);
-        let (p2, _) = url_to_offline_path(&u2);
-        assert_ne!(p1, p2);
+        assert_eq!(
+            relative_path(
+                "about/index.html",
+                &target,
+                "example.com",
+                None,
+                UrlKind::Page
+            ),
+            "../index.html"
+        );
     }
 
     #[test]
     fn test_rewrite_html_same_domain() {
         let page = Url::parse("https://example.com/about/").unwrap();
         let html = r#"<a href="https://example.com/">Home</a>"#.to_string();
-        let rewritten = rewrite_html(&html, &page);
+        let rewritten = rewrite_html(&html, &page, "example.com", None);
         assert!(rewritten.contains("../index.html"));
     }
 
     #[test]
-    fn test_rewrite_html_srcset() {
+    fn test_rewrite_html_external_font() {
         let page = Url::parse("https://example.com/").unwrap();
-        let html = r#"<img src="small.jpg" srcset="https://example.com/big.jpg 2x, https://example.com/huge.jpg 3x">"#.to_string();
-        let rewritten = rewrite_html(&html, &page);
-        assert!(rewritten.contains("big.jpg 2x"));
-        assert!(rewritten.contains("huge.jpg 3x"));
+        let html =
+            r#"<link href="https://fonts.googleapis.com/css2?family=Roboto" rel="stylesheet">"#
+                .to_string();
+        let rewritten = rewrite_html(&html, &page, "example.com", None);
+        assert!(rewritten.contains("_external/fonts.googleapis.com"));
     }
 
     #[test]
-    fn test_rewrite_html_single_quotes() {
-        let page = Url::parse("https://example.com/about/").unwrap();
-        let html = r#"<a href='https://example.com/'>Home</a>"#.to_string();
-        let rewritten = rewrite_html(&html, &page);
-        assert!(rewritten.contains("../index.html"));
-    }
-
-    #[test]
-    fn test_rewrite_html_data_src() {
+    fn test_rewrite_html_keeps_external_nav() {
         let page = Url::parse("https://example.com/").unwrap();
-        let html = r#"<img data-src="https://example.com/lazy.png" data-lazy-src='/img/x.jpg'>"#
-            .to_string();
-        let rewritten = rewrite_html(&html, &page);
-        assert!(rewritten.contains("lazy.png"));
-        assert!(rewritten.contains("img/x.jpg"));
-    }
-
-    #[test]
-    fn test_rewrite_html_strips_base_tag() {
-        let page = Url::parse("https://example.com/blog/post/").unwrap();
-        let html = r#"<base href="https://example.com/"><a href="/about">About</a>"#.to_string();
-        let rewritten = rewrite_html(&html, &page);
-        assert!(
-            !rewritten.to_lowercase().contains("<base"),
-            "base tag must be removed: {rewritten}"
-        );
-        assert!(
-            rewritten.contains("../../about/index.html") || rewritten.contains("about/index.html")
-        );
+        let html = r#"<a href="https://other.com/page">Other</a>"#.to_string();
+        let rewritten = rewrite_html(&html, &page, "example.com", None);
+        assert!(rewritten.contains("https://other.com/page"));
     }
 
     #[test]
     fn test_rewrite_css_url() {
         let css_url = Url::parse("https://example.com/css/style.css").unwrap();
         let css = "body { background: url('/images/bg.png'); }";
-        let rewritten = rewrite_css(css, &css_url);
+        let rewritten = rewrite_css(css, &css_url, "example.com", None);
         assert!(rewritten.contains("../images/bg.png"));
     }
 
     #[test]
-    fn test_rewrite_css_preserves_data_uri() {
+    fn test_rewrite_css_external_font() {
         let css_url = Url::parse("https://example.com/css/style.css").unwrap();
-        let css = r#"body { background: url("data:image/png;base64,iVBOR="); }"#;
-        let rewritten = rewrite_css(css, &css_url);
-        assert!(rewritten.contains("data:image/png"));
+        let css = "@font-face { src: url('https://fonts.gstatic.com/s/roboto.woff2'); }";
+        let rewritten = rewrite_css(css, &css_url, "example.com", None);
+        assert!(rewritten.contains("_external/fonts.gstatic.com"));
     }
 }

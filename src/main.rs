@@ -1,17 +1,10 @@
 use std::process;
 
 use clap::Parser;
+use sitegrab::crawler;
+use sitegrab::manifest;
+use sitegrab::offline;
 use url::Url;
-
-mod archiver;
-mod crawler;
-mod manifest;
-mod pathmap;
-mod rewriter;
-mod util;
-
-#[cfg(feature = "render")]
-mod renderer;
 
 #[derive(Parser)]
 #[command(
@@ -237,12 +230,26 @@ async fn main() {
         Ok(stats) => {
             if !args.no_zip {
                 let zip_path = format!("{}.zip", output_dir);
-                if let Err(e) = archiver::create_zip(&output_dir, &zip_path) {
+                if let Err(e) = sitegrab::archiver::create_zip(&output_dir, &zip_path) {
                     eprintln!("warning: Failed to create zip: {e}");
+                } else if let Err(e) = offline::assert_offline_closure(&output_dir, &host) {
+                    eprintln!("warning: Offline closure check failed: {e}");
                 }
+            } else if let Err(e) = offline::assert_offline_closure(&output_dir, &host) {
+                eprintln!("warning: Offline closure check failed: {e}");
             }
-            if stats.errors > 0 {
-                println!("⚠  {} errors (see above)", stats.errors);
+
+            match stats.outcome {
+                crawler::CrawlOutcome::Complete => {}
+                crawler::CrawlOutcome::Partial => {
+                    if stats.errors > 0 {
+                        eprintln!("warning: {} resource errors during crawl", stats.errors);
+                    }
+                    process::exit(2);
+                }
+                crawler::CrawlOutcome::Failed => {
+                    process::exit(1);
+                }
             }
         }
         Err(e) => {

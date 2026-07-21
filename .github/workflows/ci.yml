@@ -28,3 +28,64 @@ jobs:
 
       - name: Test (no default features)
         run: cargo test --no-default-features
+
+  offline-smoke:
+    name: Offline smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Chromium
+        run: sudo apt-get update && sudo apt-get install -y chromium-browser
+
+      - name: Build sitegrab
+        run: cargo build --release --all-features
+
+      - name: Mirror example.com
+        run: ./target/release/sitegrab https://example.com --output /tmp/example-offline --jobs 4
+
+      - name: Offline closure check
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          root = "/tmp/example-offline"
+          missing = []
+          for dirpath, _, files in os.walk(root):
+              for name in files:
+                  if not name.endswith((".html", ".htm", ".css")):
+                      continue
+                  path = os.path.join(dirpath, name)
+                  with open(path, encoding="utf-8", errors="ignore") as f:
+                      text = f.read()
+                  for token in ('href="', "href='", 'src="', "src='"):
+                      start = 0
+                      while True:
+                          i = text.find(token, start)
+                          if i < 0:
+                              break
+                          q = token[-1]
+                          j = text.find(q, i + len(token))
+                          if j < 0:
+                              break
+                          ref = text[i + len(token):j]
+                          start = j + 1
+                          if ref.startswith(("#", "data:", "javascript:", "http://", "https://", "mailto:")):
+                              continue
+                          target = os.path.normpath(os.path.join(dirpath, ref))
+                          if not os.path.exists(target):
+                              missing.append(f"{path} -> {ref}")
+          if missing:
+              print("missing references:")
+              print("\n".join(missing[:20]))
+              sys.exit(1)
+          print("offline closure ok")
+          PY
+
+      - name: Verify ZIP extracts
+        run: |
+          test -f /tmp/example-offline.zip
+          unzip -q /tmp/example-offline.zip -d /tmp/example-unzipped
+          test -f /tmp/example-unzipped/index.html
