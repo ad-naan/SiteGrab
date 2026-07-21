@@ -28,16 +28,26 @@ Concurrently downloads HTML, CSS, JS, images, fonts, and media. **Auto-detects S
 curl -sSL https://raw.githubusercontent.com/kerwin2046/SiteGrab/main/install.sh | bash
 ```
 
+On Linux x86_64 the installer prefers the fully static **musl** build
+(`sitegrab-linux-x86_64-musl.tar.gz`), which runs on any distribution
+regardless of glibc version. It falls back to the glibc build (built on
+Ubuntu 22.04 / glibc 2.35) and finally to building from source.
+
 ### From source
 
 ```bash
-cargo install --git https://github.com/kerwin2046/SiteGrab
+cargo install --git https://github.com/kerwin2046/SiteGrab --force
 ```
+
 ### Pre-built binary (manual)
 
 ```bash
-# Linux / macOS
-curl -sSL https://github.com/kerwin2046/SiteGrab/releases/latest/download/sitegrab-linux-x86_64.tar.gz | tar xz
+# Linux x86_64 (static musl — works on any distro)
+curl -sSL https://github.com/kerwin2046/SiteGrab/releases/latest/download/sitegrab-linux-x86_64-musl.tar.gz | tar xz
+sudo mv sitegrab /usr/local/bin/
+
+# macOS
+curl -sSL https://github.com/kerwin2046/SiteGrab/releases/latest/download/sitegrab-macos-x86_64.tar.gz | tar xz
 sudo mv sitegrab /usr/local/bin/
 
 # Windows (PowerShell)

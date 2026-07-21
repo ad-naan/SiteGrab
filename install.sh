@@ -65,25 +65,48 @@ download_and_install() {
     # only — os is always "linux"/"macos" with no underscore.
     os="${platform%%_*}"
     arch="${platform#*_}"
-    local archive_url="https://github.com/${REPO}/releases/download/${version}/${BIN_NAME}-${os}-${arch}.tar.gz"
-    local archive_name="${BIN_NAME}-${os}-${arch}.tar.gz"
+
+    # Candidate archive basenames, in preference order. For Linux x86_64 we
+    # prefer the fully static musl build so it runs regardless of glibc version.
+    local candidates=()
+    if [ "$os" = "linux" ] && [ "$arch" = "x86_64" ]; then
+        candidates+=("${BIN_NAME}-${os}-${arch}-musl")
+    fi
+    candidates+=("${BIN_NAME}-${os}-${arch}")
+
     local sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS"
 
     TMPDIR="$(mktemp -d)"
     cd "$TMPDIR"
 
-    info "Downloading ${archive_url} ..."
     if command -v curl >/dev/null 2>&1; then
-        curl -sL -o "$archive_name" "$archive_url"
         curl -sL -o SHA256SUMS "$sums_url" || true
     else
-        wget -qO "$archive_name" "$archive_url"
         wget -qO SHA256SUMS "$sums_url" || true
     fi
 
-    if [ ! -f "$archive_name" ] || [ ! -s "$archive_name" ]; then
+    local base archive_name archive_url found=""
+    for base in "${candidates[@]}"; do
+        archive_name="${base}.tar.gz"
+        archive_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
+        info "Downloading ${archive_url} ..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -sfL -o "$archive_name" "$archive_url" || true
+        else
+            wget -qO "$archive_name" "$archive_url" || true
+        fi
+        if [ -f "$archive_name" ] && [ -s "$archive_name" ]; then
+            found="$archive_name"
+            break
+        fi
+        warn "Not available: ${archive_name}, trying next ..."
+        rm -f "$archive_name"
+    done
+
+    if [ -z "$found" ]; then
         return 1
     fi
+    archive_name="$found"
 
     if [ -f SHA256SUMS ] && [ -s SHA256SUMS ]; then
         info "Verifying checksum ..."

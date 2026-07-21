@@ -1,7 +1,7 @@
 //! Offline reference closure verification for mirrored sites.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -78,23 +78,45 @@ pub fn verify_offline_closure(output_dir: &str, _base_host: &str) -> Result<Clos
             .replace('\\', "/");
         let content = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
-        let refs = extract_local_refs(&content, &rel);
+        let from_dir = file.parent().unwrap_or(&root);
+        let refs = extract_local_refs(&content);
         for reference in refs {
             report.checked += 1;
-            let target = root.join(&reference);
-            if !pathmap::is_under_output(&target, output_dir) {
+            let resolved = resolve_local_ref(from_dir, &reference);
+            if !pathmap::is_under_output(&resolved, output_dir) {
                 report
                     .escaped
                     .push(format!("{rel} → {reference} (outside output dir)"));
                 continue;
             }
-            if !target.exists() {
+            if !resolved.exists() {
                 report.missing.push(format!("{rel} → {reference}"));
             }
         }
     }
 
     Ok(report)
+}
+
+/// Resolve a relative reference against the directory that contains the
+/// referring HTML/CSS file, then lexically normalize `.` / `..`.
+fn resolve_local_ref(from_dir: &Path, reference: &str) -> PathBuf {
+    let joined = from_dir.join(reference);
+    normalize_path(&joined)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                clean.pop();
+            }
+            Component::CurDir => {}
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    clean
 }
 
 fn collect_html_css(root: &Path) -> Vec<PathBuf> {
@@ -121,7 +143,7 @@ fn collect_html_css_inner(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn extract_local_refs(content: &str, _from_rel: &str) -> Vec<String> {
+fn extract_local_refs(content: &str) -> Vec<String> {
     let mut refs = HashSet::new();
 
     let attr_re = Regex::new(
@@ -151,12 +173,19 @@ fn push_local_ref(raw: &str, out: &mut HashSet<String>) {
         || raw.starts_with("data:")
         || raw.starts_with("javascript:")
         || raw.starts_with("mailto:")
+        || raw.starts_with("tel:")
         || raw.starts_with("http://")
         || raw.starts_with("https://")
+        || raw.starts_with("//")
     {
         return;
     }
-    let normalized = raw.replace('\\', "/");
+    // Drop URL fragments for existence checks.
+    let without_frag = raw.split('#').next().unwrap_or(raw);
+    if without_frag.is_empty() {
+        return;
+    }
+    let normalized = without_frag.replace('\\', "/");
     out.insert(normalized);
 }
 
@@ -189,6 +218,49 @@ mod tests {
     }
 
     #[test]
+    fn closure_passes_for_parent_relative_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path();
+        fs::create_dir_all(out.join("nl")).unwrap();
+        fs::create_dir_all(out.join("css")).unwrap();
+        fs::write(
+            out.join("nl/index.html"),
+            r#"<html>
+              <a href="../index.html">Home</a>
+              <link href="../css/style.css">
+              <img src="../logo.png">
+            </html>"#,
+        )
+        .unwrap();
+        fs::write(out.join("index.html"), "<html>home</html>").unwrap();
+        fs::write(out.join("css/style.css"), "body{}").unwrap();
+        fs::write(out.join("logo.png"), b"x").unwrap();
+
+        let report = verify_offline_closure(out.to_str().unwrap(), "example.com").unwrap();
+        assert!(
+            report.is_ok(),
+            "parent-relative refs must resolve under output: {report:?}"
+        );
+        assert!(report.checked >= 3);
+    }
+
+    #[test]
+    fn closure_fails_for_true_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path();
+        fs::create_dir_all(out.join("nl")).unwrap();
+        fs::write(
+            out.join("nl/index.html"),
+            r#"<a href="../../outside.html">Escape</a>"#,
+        )
+        .unwrap();
+
+        let report = verify_offline_closure(out.to_str().unwrap(), "example.com").unwrap();
+        assert!(!report.is_ok());
+        assert!(!report.escaped.is_empty());
+    }
+
+    #[test]
     fn closure_fails_for_missing_asset() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path();
@@ -197,5 +269,12 @@ mod tests {
         let report = verify_offline_closure(out.to_str().unwrap(), "example.com").unwrap();
         assert!(!report.is_ok());
         assert!(!report.missing.is_empty());
+    }
+
+    #[test]
+    fn resolve_parent_relative_against_page_dir() {
+        let from = Path::new("/tmp/mirror/nl");
+        let resolved = resolve_local_ref(from, "../index.html");
+        assert_eq!(resolved, PathBuf::from("/tmp/mirror/index.html"));
     }
 }
