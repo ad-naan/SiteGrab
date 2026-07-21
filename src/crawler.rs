@@ -1065,6 +1065,7 @@ mod spa {
     /// download all assets the browser fetched, then save pre-rendered HTML.
     ///
     /// - `wait_ms`: extra settle time after page load (for lazy-loaded content).
+    #[allow(clippy::too_many_arguments)]
     pub async fn crawl_spa(
         url: &Url,
         output_dir: &str,
