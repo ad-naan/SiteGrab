@@ -1,6 +1,9 @@
 /target
 .adnify/
+.cargo-home/
+.rustup-home/
 
 # Crawl output
 /*.zip
 /www.adnaan.site/
+/canopyseo.com/

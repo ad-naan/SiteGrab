@@ -167,7 +167,9 @@ pub(crate) fn resolve_url(base: &Url, href: &str) -> Option<Url> {
     {
         return None;
     }
-    base.join(href).ok().filter(|u| u.scheme() == "http" || u.scheme() == "https")
+    base.join(href)
+        .ok()
+        .filter(|u| u.scheme() == "http" || u.scheme() == "https")
 }
 
 /// Extract same-domain URLs from an HTML document.
@@ -274,23 +276,16 @@ fn normalize_url(url: &Url) -> Url {
 const MAX_RETRIES: u32 = 2;
 
 /// Reuse a locally fresh file: extract links for pages/CSS, skip download.
-async fn reuse_local(
-    url: &Url,
-    output_base: &str,
-    prior: &PriorState,
-) -> Result<ProcessResult> {
+async fn reuse_local(url: &Url, output_base: &str, prior: &PriorState) -> Result<ProcessResult> {
     let save_path = url_to_path(url, output_base);
-    let save_path_rel = prior
-        .rel_path
-        .clone()
-        .unwrap_or_else(|| {
-            save_path
-                .strip_prefix(output_base)
-                .unwrap_or(&save_path)
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .to_string()
-        });
+    let save_path_rel = prior.rel_path.clone().unwrap_or_else(|| {
+        save_path
+            .strip_prefix(output_base)
+            .unwrap_or(&save_path)
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string()
+    });
 
     let body = tokio::fs::read(&save_path).await?;
     let rtype = match prior.rtype.as_deref() {
@@ -448,7 +443,10 @@ async fn fetch_with_retry(
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))).await;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                500 * 2u64.pow(attempt - 1),
+            ))
+            .await;
         }
 
         let mut req = client.get(url.as_str());
@@ -733,10 +731,8 @@ fn analyze_spa_html(html: &str) -> bool {
     }
 
     // --- Heuristic: ESM module scripts + near-empty body + SPA root div ---
-    let module_count = lower
-        .matches(r#"type="module""#)
-        .count()
-        + lower.matches("type='module'").count();
+    let module_count =
+        lower.matches(r#"type="module""#).count() + lower.matches("type='module'").count();
 
     let doc = Html::parse_document(html);
 
@@ -817,8 +813,11 @@ pub async fn crawl(
     let robots = if respect_robots {
         let checker = RobotsChecker::fetch(&client, url).await;
         if !checker.disallows.is_empty() || !checker.allows.is_empty() {
-            eprintln!("info: robots.txt loaded ({} disallows, {} allows)",
-                checker.disallows.len(), checker.allows.len());
+            eprintln!(
+                "info: robots.txt loaded ({} disallows, {} allows)",
+                checker.disallows.len(),
+                checker.allows.len()
+            );
         }
         Some(checker)
     } else {
@@ -1087,14 +1086,15 @@ mod spa {
         let stats = Arc::new(AtomicStats::default());
         let out_dir = output_dir.to_string();
         let base_host = url.host_str().unwrap_or("").to_string();
-        let host_norm = base_host.strip_prefix("www.").unwrap_or(&base_host).to_string();
+        let host_norm = base_host
+            .strip_prefix("www.")
+            .unwrap_or(&base_host)
+            .to_string();
 
         // Launch headless browser.
         eprintln!("info: Launching headless browser for SPA rendering...");
         let (browser, mut handler) = renderer::launch_browser_async(no_sandbox).await?;
-        let _handler_task = tokio::spawn(async move {
-            while handler.next().await.is_some() {}
-        });
+        let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         // robots.txt
         let robots = if respect_robots {
@@ -1258,13 +1258,7 @@ mod spa {
 
             // Download assets concurrently.
             download_assets(
-                &assets,
-                &client,
-                &out_dir,
-                &pb,
-                &stats,
-                &semaphore,
-                &manifest,
+                &assets, &client, &out_dir, &pb, &stats, &semaphore, &manifest,
             )
             .await;
 

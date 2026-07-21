@@ -187,7 +187,9 @@ mod tests {
         assert!(loaded.is_fresh("https://example.com/", &dir));
         assert_eq!(loaded.rtype_of("https://example.com/"), Some("page"));
         assert_eq!(
-            loaded.entry("https://example.com/").and_then(|e| e.etag.as_deref()),
+            loaded
+                .entry("https://example.com/")
+                .and_then(|e| e.etag.as_deref()),
             Some("\"abc\"")
         );
 

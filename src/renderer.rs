@@ -157,11 +157,7 @@ pub async fn render_page(
         }
     });
 
-    let goto_result = tokio::time::timeout(
-        RENDER_TIMEOUT,
-        page.goto(url.as_str()),
-    )
-    .await;
+    let goto_result = tokio::time::timeout(RENDER_TIMEOUT, page.goto(url.as_str())).await;
 
     match goto_result {
         Ok(Ok(_)) => {}
@@ -295,7 +291,10 @@ pub fn looks_like_spa(html: &str) -> bool {
     let has_script = lower.contains("<script");
 
     // Estimate visible text: strip tags naively
-    let text_len = strip_tags(&lower).chars().filter(|c| !c.is_whitespace()).count();
+    let text_len = strip_tags(&lower)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .count();
 
     has_mount && has_script && text_len < 200
 }

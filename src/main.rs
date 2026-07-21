@@ -163,12 +163,22 @@ async fn main() {
             }
             Ok(None) => {
                 let _ = std::fs::create_dir_all(&output_dir);
-                (Some(tokio::sync::Mutex::new(manifest::Manifest::new(url.as_str()))), false)
+                (
+                    Some(tokio::sync::Mutex::new(manifest::Manifest::new(
+                        url.as_str(),
+                    ))),
+                    false,
+                )
             }
             Err(e) => {
                 eprintln!("warning: Failed to load manifest: {e}, starting fresh");
                 let _ = std::fs::create_dir_all(&output_dir);
-                (Some(tokio::sync::Mutex::new(manifest::Manifest::new(url.as_str()))), false)
+                (
+                    Some(tokio::sync::Mutex::new(manifest::Manifest::new(
+                        url.as_str(),
+                    ))),
+                    false,
+                )
             }
         }
     };

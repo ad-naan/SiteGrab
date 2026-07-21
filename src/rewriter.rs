@@ -9,9 +9,7 @@ use crate::pathmap;
 fn relative_path(page_path: &str, target_url: &Url) -> String {
     let target_path = pathmap::url_to_offline_path(target_url);
 
-    let page_dir = Path::new(page_path)
-        .parent()
-        .unwrap_or(Path::new(""));
+    let page_dir = Path::new(page_path).parent().unwrap_or(Path::new(""));
 
     if page_dir.as_os_str().is_empty() && target_path == "index.html" {
         return target_path;
@@ -22,10 +20,7 @@ fn relative_path(page_path: &str, target_url: &Url) -> String {
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
 
-    let target_comps: Vec<&str> = target_path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let target_comps: Vec<&str> = target_path.split('/').filter(|s| !s.is_empty()).collect();
 
     let common = dir_comps
         .iter()
@@ -78,9 +73,7 @@ fn attr_regex() -> &'static Regex {
 
 fn srcset_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)(\s+srcset\s*=\s*)(?:"([^"]*?)"|'([^']*?)')"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"(?i)(\s+srcset\s*=\s*)(?:"([^"]*?)"|'([^']*?)')"#).unwrap())
 }
 
 fn base_tag_regex() -> &'static Regex {
@@ -104,14 +97,11 @@ fn extract_base_href(html: &str, page_url: &Url) -> Option<Url> {
     page_url.join(cap.get(1)?.as_str()).ok()
 }
 
-
 /// Cached regex to remove `<script>...</script>` blocks (including self-closing).
 #[cfg(feature = "render")]
 fn script_tag_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap())
 }
 
 /// Remove all `<script>` tags from HTML. This is used for SPA pages so the
@@ -248,7 +238,6 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
     strip_offline_breakers(result)
 }
 
-
 /// Regex matching `<link rel="manifest">` tags — causes CORS errors when
 /// the mirror is opened from `file://`.
 fn manifest_link_regex() -> &'static Regex {
@@ -297,9 +286,7 @@ fn sw_inline_script_regex() -> &'static Regex {
 /// `crossorigin="use-credentials"`, with single or double quotes.
 fn crossorigin_attr_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)\s+crossorigin(?:\s*=\s*["'][^"']*["'])?"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"(?i)\s+crossorigin(?:\s*=\s*["'][^"']*["'])?"#).unwrap())
 }
 
 /// Remove artifacts that break offline browsing under `file://`:
@@ -333,9 +320,7 @@ fn strip_offline_breakers(html: String) -> String {
             None => continue,
         };
         let body = cap.get(1).map(|b| b.as_str()).unwrap_or("");
-        if body.contains("serviceWorker")
-            || body.contains("registerSW")
-            || body.contains("workbox")
+        if body.contains("serviceWorker") || body.contains("registerSW") || body.contains("workbox")
         {
             result.push_str(&after_re[last_end..m.start()]);
             last_end = m.end();
@@ -524,8 +509,8 @@ mod tests {
     #[test]
     fn test_rewrite_html_data_src() {
         let page = Url::parse("https://example.com/").unwrap();
-        let html =
-            r#"<img data-src="https://example.com/lazy.png" data-lazy-src='/img/x.jpg'>"#.to_string();
+        let html = r#"<img data-src="https://example.com/lazy.png" data-lazy-src='/img/x.jpg'>"#
+            .to_string();
         let rewritten = rewrite_html(&html, &page);
         assert!(rewritten.contains("lazy.png"));
         assert!(rewritten.contains("img/x.jpg"));
@@ -540,7 +525,9 @@ mod tests {
             !rewritten.to_lowercase().contains("<base"),
             "base tag must be removed: {rewritten}"
         );
-        assert!(rewritten.contains("../../about/index.html") || rewritten.contains("about/index.html"));
+        assert!(
+            rewritten.contains("../../about/index.html") || rewritten.contains("about/index.html")
+        );
     }
 
     #[test]
