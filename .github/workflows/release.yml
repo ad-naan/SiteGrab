@@ -31,6 +31,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: sitegrab-windows-x86_64.zip
+            binary: sitegrab.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -90,11 +91,16 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Verify archives
-        run: ls -lh sitegrab-*
+      - name: Verify archives and checksums
+        run: |
+          ls -lh sitegrab-*
+          sha256sum sitegrab-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: sitegrab-*
+          files: |
+            sitegrab-*
+            SHA256SUMS
           generate_release_notes: true

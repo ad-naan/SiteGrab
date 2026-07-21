@@ -91,16 +91,19 @@ fn find_browser() -> Result<PathBuf> {
 }
 
 /// Build a headless browser configuration.
-fn build_config() -> Result<BrowserConfig> {
+fn build_config(no_sandbox: bool) -> Result<BrowserConfig> {
     let exec = find_browser()?;
-    BrowserConfig::builder()
+    let mut builder = BrowserConfig::builder()
         .chrome_executable(exec)
-        .arg("--no-sandbox")
         .arg("--disable-gpu")
         .arg("--disable-dev-shm-usage")
         .arg("--disable-extensions")
         .arg("--disable-background-networking")
-        .window_size(1280, 800)
+        .window_size(1280, 800);
+    if no_sandbox {
+        builder = builder.arg("--no-sandbox");
+    }
+    builder
         .build()
         .map_err(|e| anyhow!("Failed to build browser config: {e}"))
 }
@@ -109,11 +112,13 @@ fn build_config() -> Result<BrowserConfig> {
 ///
 /// Returns `(Browser, handler)`. Spawn the handler immediately on a task:
 /// ```ignore
-/// let (browser, mut handler) = renderer::launch_browser_async().await?;
+/// let (browser, mut handler) = renderer::launch_browser_async(false).await?;
 /// tokio::spawn(async move { while let Some(_h) = handler.next().await {} });
 /// ```
-pub async fn launch_browser_async() -> Result<(Browser, chromiumoxide::handler::Handler)> {
-    let config = build_config()?;
+pub async fn launch_browser_async(
+    no_sandbox: bool,
+) -> Result<(Browser, chromiumoxide::handler::Handler)> {
+    let config = build_config(no_sandbox)?;
     Browser::launch(config)
         .await
         .map_err(|e| anyhow!("Failed to launch browser: {e}"))

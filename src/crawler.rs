@@ -11,8 +11,9 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
-use crate::rewriter;
 use crate::manifest::Manifest;
+use crate::pathmap;
+use crate::rewriter;
 use crate::util::format_bytes;
 
 /// Crawl statistics
@@ -23,6 +24,35 @@ pub struct Stats {
     pub js: usize,
     pub total_bytes: u64,
     pub errors: usize,
+}
+
+/// Soft caps for a crawl run.
+#[derive(Clone, Copy, Debug)]
+pub struct CrawlLimits {
+    pub max_pages: usize,
+    /// 0 means unlimited.
+    pub max_bytes: u64,
+}
+
+impl Default for CrawlLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 10_000,
+            max_bytes: 0,
+        }
+    }
+}
+
+impl CrawlLimits {
+    fn reached(&self, stats: &AtomicStats) -> bool {
+        if stats.pages.load(Ordering::Relaxed) >= self.max_pages {
+            return true;
+        }
+        if self.max_bytes > 0 && stats.total_bytes.load(Ordering::Relaxed) >= self.max_bytes {
+            return true;
+        }
+        false
+    }
 }
 
 /// URL classification
@@ -41,8 +71,22 @@ pub(crate) struct ProcessResult {
     url: String,
     save_path: String,
     new_urls: Vec<Url>,
+    /// Final on-disk bytes (for manifest hashing).
     bytes: Vec<u8>,
     mtime: Option<String>,
+    etag: Option<String>,
+    /// Content was reused via 304 or local hash match (no re-write).
+    not_modified: bool,
+}
+
+/// Optional validators from a previous manifest entry.
+#[derive(Clone, Default)]
+pub(crate) struct PriorState {
+    pub etag: Option<String>,
+    pub mtime: Option<String>,
+    pub local_fresh: bool,
+    pub rtype: Option<String>,
+    pub rel_path: Option<String>,
 }
 
 /// Determine resource type from content-type header and URL path
@@ -105,58 +149,9 @@ fn classify_by_ext(path: &str) -> ResourceType {
     ResourceType::Other
 }
 
-/// Sanitise a string for safe use in a file path component.
-fn sanitize_path_component(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect()
-}
-
-/// Convert URL to filesystem path, encoding query strings to avoid collisions.
+/// Convert URL to filesystem path under `output_base` (traversal-safe).
 fn url_to_path(url: &Url, output_base: &str) -> PathBuf {
-    let raw = url.path().trim_start_matches('/');
-    let query = url.query();
-
-    let query_suffix = match query {
-        Some(q) if !q.is_empty() => {
-            let sane = sanitize_path_component(q);
-            format!("@{}", sane)
-        }
-        _ => String::new(),
-    };
-
-    let path = if raw.is_empty() || raw.ends_with('/') {
-        if query_suffix.is_empty() {
-            format!("{}index.html", raw)
-        } else {
-            format!("{}{}/index.html", raw, query_suffix)
-        }
-    } else {
-        let last_seg = raw.rsplit('/').next().unwrap_or("");
-        if last_seg.contains('.') {
-            if query_suffix.is_empty() {
-                raw.to_string()
-            } else {
-                let dot_pos = last_seg.rfind('.').unwrap_or(last_seg.len());
-                let (name, ext) = last_seg.split_at(dot_pos);
-                let new_last = format!("{}{}{}", name, query_suffix, ext);
-                if let Some(prefix) = raw.strip_suffix(last_seg) {
-                    format!("{}{}", prefix, new_last)
-                } else {
-                    new_last
-                }
-            }
-        } else if query_suffix.is_empty() {
-            format!("{}/index.html", raw)
-        } else {
-            format!("{}{}/index.html", raw, query_suffix)
-        }
-    };
-
-    PathBuf::from(output_base).join(&path)
+    pathmap::url_to_path(url, output_base)
 }
 
 /// Resolve a potentially relative URL, skipping non-HTTP(S) protocols
@@ -278,16 +273,93 @@ fn normalize_url(url: &Url) -> Url {
 /// Maximum retry attempts for transient errors (5xx, connection failures).
 const MAX_RETRIES: u32 = 2;
 
+/// Reuse a locally fresh file: extract links for pages/CSS, skip download.
+async fn reuse_local(
+    url: &Url,
+    output_base: &str,
+    prior: &PriorState,
+) -> Result<ProcessResult> {
+    let save_path = url_to_path(url, output_base);
+    let save_path_rel = prior
+        .rel_path
+        .clone()
+        .unwrap_or_else(|| {
+            save_path
+                .strip_prefix(output_base)
+                .unwrap_or(&save_path)
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string()
+        });
+
+    let body = tokio::fs::read(&save_path).await?;
+    let rtype = match prior.rtype.as_deref() {
+        Some("page") => ResourceType::Page,
+        Some("css") => ResourceType::Css,
+        Some("js") => ResourceType::Js,
+        Some("image") => ResourceType::Image,
+        Some(_) => ResourceType::Other,
+        None => classify_by_ext(url.path()),
+    };
+
+    let host = url.host_str().unwrap_or("");
+    let new_urls = match rtype {
+        ResourceType::Page => {
+            let html_str = String::from_utf8_lossy(&body);
+            let doc = Html::parse_document(&html_str);
+            extract_urls(&doc, url, host)
+        }
+        ResourceType::Css => {
+            let css_str = String::from_utf8_lossy(&body);
+            extract_css_urls(&css_str, url, host)
+        }
+        _ => Vec::new(),
+    };
+
+    let norm = normalize_url(url);
+    Ok(ProcessResult {
+        rtype,
+        url: norm.as_str().to_string(),
+        save_path: save_path_rel,
+        new_urls,
+        bytes: body,
+        mtime: prior.mtime.clone(),
+        etag: prior.etag.clone(),
+        not_modified: true,
+    })
+}
+
 /// Process a single URL: download (with retry), save, return discovered links.
 pub(crate) async fn process_one(
     client: &Client,
     url: &Url,
     output_base: &str,
     pb: &ProgressBar,
+    prior: Option<PriorState>,
 ) -> Result<ProcessResult> {
     pb.set_message(format!("Fetching {}", url.path()));
 
-    let response = fetch_with_retry(client, url).await?;
+    let save_path = url_to_path(url, output_base);
+    let file_exists = save_path.exists();
+
+    // Local hash match and no validators → reuse without network.
+    // If validators exist, prefer conditional GET to detect remote changes.
+    if let Some(ref p) = prior {
+        let has_validators = p.etag.is_some() || p.mtime.is_some();
+        if p.local_fresh && file_exists && !has_validators {
+            return reuse_local(url, output_base, p).await;
+        }
+    }
+
+    let conditional = prior.as_ref().filter(|_| file_exists);
+    let response = fetch_with_retry(client, url, conditional).await?;
+
+    if response.status() == StatusCode::NOT_MODIFIED {
+        if let Some(ref p) = prior {
+            return reuse_local(url, output_base, p).await;
+        }
+        anyhow::bail!("HTTP 304 for {} but no local entry", url);
+    }
 
     let content_type = response
         .headers()
@@ -302,10 +374,16 @@ pub(crate) async fn process_one(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
     let body = response.bytes().await?;
     let rtype = classify(content_type.as_deref(), url);
 
-    let save_path = url_to_path(url, output_base);
     let save_path_rel = save_path
         .strip_prefix(output_base)
         .unwrap_or(&save_path)
@@ -318,28 +396,31 @@ pub(crate) async fn process_one(
     }
 
     // For pages and CSS, rewrite links and extract sub-resources.
-    // For everything else (JS, images, fonts), save raw bytes.
-    let new_urls = match rtype {
+    // Manifest hashes the final on-disk bytes (rewritten when applicable).
+    let (new_urls, written) = match rtype {
         ResourceType::Page => {
             let html_str = String::from_utf8_lossy(&body);
             let rewritten = rewriter::rewrite_html(&html_str, url);
-            tokio::fs::write(&save_path, rewritten.as_bytes()).await?;
+            let written = rewritten.into_bytes();
+            tokio::fs::write(&save_path, &written).await?;
 
             let doc = Html::parse_document(&html_str);
             let host = url.host_str().unwrap_or("");
-            extract_urls(&doc, url, host)
+            (extract_urls(&doc, url, host), written)
         }
         ResourceType::Css => {
             let css_str = String::from_utf8_lossy(&body);
             let rewritten = rewriter::rewrite_css(&css_str, url);
-            tokio::fs::write(&save_path, rewritten.as_bytes()).await?;
+            let written = rewritten.into_bytes();
+            tokio::fs::write(&save_path, &written).await?;
 
             let host = url.host_str().unwrap_or("");
-            extract_css_urls(&css_str, url, host)
+            (extract_css_urls(&css_str, url, host), written)
         }
         _ => {
-            tokio::fs::write(&save_path, &body).await?;
-            Vec::new()
+            let written = body.to_vec();
+            tokio::fs::write(&save_path, &written).await?;
+            (Vec::new(), written)
         }
     };
 
@@ -349,13 +430,20 @@ pub(crate) async fn process_one(
         url: norm.as_str().to_string(),
         save_path: save_path_rel,
         new_urls,
-        bytes: body.to_vec(),
+        bytes: written,
         mtime,
+        etag,
+        not_modified: false,
     })
 }
 
 /// Fetch a URL with retry on transient errors (5xx, rate-limit, network).
-async fn fetch_with_retry(client: &Client, url: &Url) -> Result<reqwest::Response> {
+/// When `prior` is set, sends conditional validators and accepts 304.
+async fn fetch_with_retry(
+    client: &Client,
+    url: &Url,
+    prior: Option<&PriorState>,
+) -> Result<reqwest::Response> {
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=MAX_RETRIES {
@@ -363,10 +451,20 @@ async fn fetch_with_retry(client: &Client, url: &Url) -> Result<reqwest::Respons
             tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))).await;
         }
 
-        match client.get(url.as_str()).send().await {
+        let mut req = client.get(url.as_str());
+        if let Some(p) = prior {
+            if let Some(ref etag) = p.etag {
+                req = req.header(reqwest::header::IF_NONE_MATCH, etag.as_str());
+            }
+            if let Some(ref mtime) = p.mtime {
+                req = req.header(reqwest::header::IF_MODIFIED_SINCE, mtime.as_str());
+            }
+        }
+
+        match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                if status == StatusCode::OK {
+                if status == StatusCode::OK || status == StatusCode::NOT_MODIFIED {
                     return Ok(resp);
                 }
                 if (status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS)
@@ -516,9 +614,29 @@ impl RobotsChecker {
     }
 }
 
+/// True when an intercepted network URL is the HTML document itself
+/// (should not be re-downloaded as an asset after SPA render).
+pub(crate) fn is_spa_document_url(asset: &Url, page_url: &Url, final_url: &Url) -> bool {
+    let a = normalize_url(asset);
+    a == normalize_url(page_url) || a == normalize_url(final_url)
+}
+
 #[cfg(test)]
 mod robots_tests {
     use super::*;
+
+    #[test]
+    fn test_spa_document_url_excludes_page_and_final() {
+        let page = Url::parse("https://example.com/app").unwrap();
+        let final_url = Url::parse("https://example.com/app/").unwrap();
+        let doc = Url::parse("https://example.com/app").unwrap();
+        let doc_slash = Url::parse("https://example.com/app/").unwrap();
+        let asset = Url::parse("https://example.com/app.js").unwrap();
+
+        assert!(is_spa_document_url(&doc, &page, &final_url));
+        assert!(is_spa_document_url(&doc_slash, &page, &final_url));
+        assert!(!is_spa_document_url(&asset, &page, &final_url));
+    }
 
     #[test]
     fn test_robots_no_rules() {
@@ -658,6 +776,18 @@ fn analyze_spa_html(html: &str) -> bool {
     false
 }
 
+/// Build conditional/local reuse state from an existing manifest entry.
+fn prior_from_manifest(mf: &Manifest, url: &str, output_dir: &str) -> Option<PriorState> {
+    let entry = mf.entry(url)?;
+    Some(PriorState {
+        etag: entry.etag.clone(),
+        mtime: entry.mtime.clone(),
+        local_fresh: mf.is_fresh(url, output_dir),
+        rtype: Some(entry.rtype.clone()),
+        rel_path: Some(entry.path.clone()),
+    })
+}
+
 /// Run a full BFS crawl of a website.
 pub async fn crawl(
     url: &Url,
@@ -665,6 +795,7 @@ pub async fn crawl(
     concurrency: usize,
     manifest: Option<tokio::sync::Mutex<Manifest>>,
     respect_robots: bool,
+    limits: CrawlLimits,
 ) -> Result<Stats> {
     let client = Arc::new(
         Client::builder()
@@ -675,20 +806,12 @@ pub async fn crawl(
     );
 
     let stats = Arc::new(AtomicStats::default());
+    // `visited` tracks URLs processed in *this* run only — never pre-seed from
+    // the manifest, or incremental runs would skip link rediscovery.
     let visited = Arc::new(Mutex::new(HashSet::new()));
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let seed = normalize_url(url);
     let out_dir = output_dir.to_string();
-
-    // Pre-populate visited set from manifest
-    if let Some(ref mf) = manifest {
-        let mf = mf.lock().await;
-        for url_str in &mf.visited {
-            if let Ok(u) = Url::parse(url_str) {
-                visited.lock().await.insert(normalize_url(&u));
-            }
-        }
-    }
 
     // Fetch robots.txt if requested
     let robots = if respect_robots {
@@ -719,6 +842,13 @@ pub async fn crawl(
         v.insert(seed.clone());
     }
 
+    let seed_prior = if let Some(ref mf) = manifest {
+        let mf = mf.lock().await;
+        prior_from_manifest(&mf, seed.as_str(), &out_dir)
+    } else {
+        None
+    };
+
     let permit = semaphore.clone().acquire_owned().await.unwrap();
 
     // Clone before first spawn
@@ -728,10 +858,14 @@ pub async fn crawl(
     let o1 = out_dir.clone();
     set.spawn(async move {
         let _permit = permit;
-        let res = process_one(&c1, &seed, &o1, &pb1).await;
+        let res = process_one(&c1, &seed, &o1, &pb1, seed_prior).await;
         match res {
             Ok(pr) => {
-                s1.record(pr.rtype, pr.bytes.len() as u64);
+                if !pr.not_modified {
+                    s1.record(pr.rtype, pr.bytes.len() as u64);
+                } else {
+                    s1.record(pr.rtype, 0);
+                }
                 Ok(pr)
             }
             Err(e) => {
@@ -745,14 +879,29 @@ pub async fn crawl(
     while let Some(result) = set.join_next().await {
         match result {
             Ok(Ok(pr)) => {
-                // Record in manifest
+                // Record in manifest (hash of final on-disk bytes)
                 if let Some(ref mf) = manifest {
                     let mut mf = mf.lock().await;
                     let rtype_str = rtype_to_str(pr.rtype);
-                    mf.record(pr.url, pr.save_path, &pr.bytes, pr.mtime, rtype_str);
+                    mf.record(
+                        pr.url,
+                        pr.save_path,
+                        &pr.bytes,
+                        pr.mtime,
+                        pr.etag,
+                        rtype_str,
+                    );
                 }
 
                 for new_url in pr.new_urls {
+                    if limits.reached(&stats) {
+                        eprintln!(
+                            "info: crawl limit reached (max_pages={}, max_bytes={}) — stopping enqueue",
+                            limits.max_pages, limits.max_bytes
+                        );
+                        break;
+                    }
+
                     let norm = normalize_url(&new_url);
                     let is_new = {
                         let mut v = visited.lock().await;
@@ -760,18 +909,6 @@ pub async fn crawl(
                     };
                     if !is_new {
                         continue;
-                    }
-
-                    // Check if already downloaded (incremental / resume)
-                    if let Some(ref mf) = manifest {
-                        let mf = mf.lock().await;
-                        if mf.is_fresh(norm.as_str(), &out_dir) {
-                            let rtype = mf.rtype_of(norm.as_str());
-                            if let Some(rt) = rtype {
-                                record_skipped(&stats, rt);
-                            }
-                            continue;
-                        }
                     }
 
                     // Check robots.txt
@@ -782,6 +919,13 @@ pub async fn crawl(
                         }
                     }
 
+                    let prior = if let Some(ref mf) = manifest {
+                        let mf = mf.lock().await;
+                        prior_from_manifest(&mf, norm.as_str(), &out_dir)
+                    } else {
+                        None
+                    };
+
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     let c = Arc::clone(&client);
                     let s = Arc::clone(&stats);
@@ -789,10 +933,14 @@ pub async fn crawl(
                     let o = out_dir.clone();
                     set.spawn(async move {
                         let _permit = permit;
-                        let res = process_one(&c, &new_url, &o, &p).await;
+                        let res = process_one(&c, &new_url, &o, &p, prior).await;
                         match res {
                             Ok(pr) => {
-                                s.record(pr.rtype, pr.bytes.len() as u64);
+                                if !pr.not_modified {
+                                    s.record(pr.rtype, pr.bytes.len() as u64);
+                                } else {
+                                    s.record(pr.rtype, 0);
+                                }
                                 Ok(pr)
                             }
                             Err(e) => {
@@ -852,16 +1000,6 @@ fn rtype_to_str(r: ResourceType) -> &'static str {
         ResourceType::Image => "image",
         ResourceType::Other => "other",
     }
-}
-
-fn record_skipped(stats: &AtomicStats, rtype: &str) {
-    match rtype {
-        "page" => stats.pages.fetch_add(1, Ordering::Relaxed),
-        "css" => stats.css.fetch_add(1, Ordering::Relaxed),
-        "js" => stats.js.fetch_add(1, Ordering::Relaxed),
-        "image" => stats.images.fetch_add(1, Ordering::Relaxed),
-        _ => return,
-    };
 }
 
 // --- Atomic stats for concurrent updates ---
@@ -935,6 +1073,8 @@ mod spa {
         manifest: Option<tokio::sync::Mutex<Manifest>>,
         respect_robots: bool,
         wait_ms: u64,
+        limits: CrawlLimits,
+        no_sandbox: bool,
     ) -> Result<Stats> {
         let client = Arc::new(
             Client::builder()
@@ -951,7 +1091,7 @@ mod spa {
 
         // Launch headless browser.
         eprintln!("info: Launching headless browser for SPA rendering...");
-        let (browser, mut handler) = renderer::launch_browser_async().await?;
+        let (browser, mut handler) = renderer::launch_browser_async(no_sandbox).await?;
         let _handler_task = tokio::spawn(async move {
             while handler.next().await.is_some() {}
         });
@@ -980,19 +1120,10 @@ mod spa {
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
         // BFS frontier of routes to render.
+        // `visited` is this-run only — do not pre-seed from the manifest.
         let mut visited: HashSet<Url> = HashSet::new();
-        // Track assets already downloaded (or queued).
+        // Track assets already downloaded (or queued) this run.
         let mut done_assets: HashSet<Url> = HashSet::new();
-
-        // Pre-populate visited/asset sets from manifest for incremental mode.
-        if let Some(ref mf) = manifest {
-            let mf = mf.lock().await;
-            for u in &mf.visited {
-                if let Ok(parsed) = Url::parse(u) {
-                    visited.insert(normalize_url(&parsed));
-                }
-            }
-        }
 
         let mut queue: VecDeque<Url> = VecDeque::new();
         let seed = normalize_url(url);
@@ -1000,14 +1131,49 @@ mod spa {
         queue.push_back(seed);
 
         // Semaphore for asset downloads.
-        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
 
         while let Some(route) = queue.pop_front() {
+            if limits.reached(&stats) {
+                eprintln!(
+                    "info: crawl limit reached (max_pages={}, max_bytes={}) — stopping SPA crawl",
+                    limits.max_pages, limits.max_bytes
+                );
+                break;
+            }
+
             // robots.txt check for this route
             if let Some(ref r) = robots {
                 if !r.is_allowed(route.path()) {
                     eprintln!("  🚫 robots.txt: skipped {}", route);
                     continue;
+                }
+            }
+
+            // Incremental: reuse fresh rendered HTML without re-launching Chrome.
+            let page_prior = if let Some(ref mf) = manifest {
+                let mf = mf.lock().await;
+                prior_from_manifest(&mf, route.as_str(), &out_dir)
+            } else {
+                None
+            };
+            if let Some(ref p) = page_prior {
+                if p.local_fresh {
+                    if let Ok(pr) = reuse_local(&route, &out_dir, p).await {
+                        stats.record(ResourceType::Page, 0);
+                        for link in pr.new_urls {
+                            let norm = normalize_url(&link);
+                            if visited.insert(norm.clone()) {
+                                let path = norm.path().to_lowercase();
+                                let last_seg = path.rsplit('/').next().unwrap_or("");
+                                let has_ext = last_seg.contains('.');
+                                if !has_ext || path.ends_with(".html") || path.ends_with(".htm") {
+                                    queue.push_back(norm);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
             }
 
@@ -1041,8 +1207,8 @@ mod spa {
                     eprintln!("  ⚠ mkdir failed: {e}");
                 }
             }
-            let html_bytes = rewritten.as_bytes();
-            if let Err(e) = tokio::fs::write(&save_path, html_bytes).await {
+            let html_bytes = rewritten.into_bytes();
+            if let Err(e) = tokio::fs::write(&save_path, &html_bytes).await {
                 eprintln!("  ⚠ write failed for {}: {e}", save_path.display());
                 stats.record_err();
             } else {
@@ -1055,7 +1221,8 @@ mod spa {
                     mf.record(
                         norm.as_str().to_string(),
                         save_path_rel.clone(),
-                        html_bytes,
+                        &html_bytes,
+                        None,
                         None,
                         "page",
                     );
@@ -1066,6 +1233,12 @@ mod spa {
             let mut assets: Vec<Url> = Vec::new();
             for asset_url in &render.resource_urls {
                 let norm = normalize_url(asset_url);
+
+                // Never re-download the document URL — it would overwrite the
+                // rendered HTML with the raw SPA shell.
+                if is_spa_document_url(&norm, &route, page_url) {
+                    continue;
+                }
 
                 // Skip CDN-internal and analytics endpoints that can't be
                 // meaningfully downloaded (Cloudflare RUM, ___cflb, etc.).
@@ -1079,23 +1252,7 @@ mod spa {
                 }
 
                 if done_assets.insert(norm.clone()) {
-                    // Skip if already fresh in manifest (incremental).
-                    let already_fresh = if let Some(ref mf) = manifest {
-                        let mf = mf.lock().await;
-                        if mf.is_fresh(norm.as_str(), &out_dir) {
-                            if let Some(rt) = mf.rtype_of(norm.as_str()) {
-                                record_skipped(&stats, rt);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if !already_fresh {
-                        assets.push(norm);
-                    }
+                    assets.push(norm);
                 }
             }
 
@@ -1168,6 +1325,12 @@ mod spa {
         let mut set: JoinSet<std::result::Result<ProcessResult, anyhow::Error>> = JoinSet::new();
 
         for url in urls {
+            let prior = if let Some(mf) = manifest {
+                let mf = mf.lock().await;
+                prior_from_manifest(&mf, url.as_str(), out_dir)
+            } else {
+                None
+            };
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let c = Arc::clone(client);
             let p = Arc::clone(pb);
@@ -1176,18 +1339,29 @@ mod spa {
 
             set.spawn(async move {
                 let _permit = permit;
-                process_one(&c, &url, &o, &p).await
+                process_one(&c, &url, &o, &p, prior).await
             });
         }
 
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok(pr)) => {
-                    stats.record(pr.rtype, pr.bytes.len() as u64);
+                    if !pr.not_modified {
+                        stats.record(pr.rtype, pr.bytes.len() as u64);
+                    } else {
+                        stats.record(pr.rtype, 0);
+                    }
                     if let Some(mf) = manifest {
                         let mut mf = mf.lock().await;
                         let rtype_str = rtype_to_str(pr.rtype);
-                        mf.record(pr.url, pr.save_path, &pr.bytes, pr.mtime, rtype_str);
+                        mf.record(
+                            pr.url,
+                            pr.save_path,
+                            &pr.bytes,
+                            pr.mtime,
+                            pr.etag,
+                            rtype_str,
+                        );
                     }
                 }
                 Ok(Err(e)) => {
@@ -1205,3 +1379,125 @@ mod spa {
 
 #[cfg(feature = "render")]
 pub use spa::crawl_spa;
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use crate::manifest::Manifest;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn e2e_crawl_downloads_page_and_image() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!(
+                        r#"<html><body><a href="{base}/about">About</a><img src="{base}/logo.png"></body></html>"#
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/about"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html><body>About page</body></html>"),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/logo.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0x89, 0x50, 0x4E, 0x47]),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().to_str().unwrap();
+        let start = Url::parse(&format!("{base}/")).unwrap();
+        let mf = tokio::sync::Mutex::new(Manifest::new(start.as_str()));
+
+        let stats = crawl(&start, out, 4, Some(mf), false, CrawlLimits::default())
+            .await
+            .unwrap();
+        assert!(stats.pages >= 2);
+        assert!(stats.images >= 1);
+        assert!(dir.path().join("index.html").exists());
+        assert!(dir.path().join("about/index.html").exists());
+        assert!(dir.path().join("logo.png").exists());
+
+        let mf = Manifest::load_from(out).unwrap().unwrap();
+        assert_eq!(
+            mf.rtype_of(start.as_str()),
+            Some("page"),
+            "manifest should record page type"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_incremental_skips_unchanged_with_etag() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let hits = AtomicUsize::new(0);
+        let hits = std::sync::Arc::new(hits);
+
+        let hits_clone = Arc::clone(&hits);
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(move |req: &wiremock::Request| {
+                hits_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                if req
+                    .headers
+                    .get("if-none-match")
+                    .map(|v| v.to_str().unwrap_or("") == "\"v1\"")
+                    .unwrap_or(false)
+                {
+                    ResponseTemplate::new(304)
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/html")
+                        .insert_header("etag", "\"v1\"")
+                        .set_body_string("<html><body>Hello</body></html>")
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().to_str().unwrap();
+        let start = Url::parse(&format!("{base}/")).unwrap();
+
+        let mf1 = tokio::sync::Mutex::new(Manifest::new(start.as_str()));
+        crawl(&start, out, 2, Some(mf1), false, CrawlLimits::default())
+            .await
+            .unwrap();
+        let first_hits = hits.load(AtomicOrdering::SeqCst);
+        assert!(first_hits >= 1);
+        assert!(dir.path().join("index.html").exists());
+
+        // Second run should send If-None-Match and get 304.
+        let mf2 = Manifest::load_from(out).unwrap().unwrap();
+        let mf2 = tokio::sync::Mutex::new(mf2);
+        crawl(&start, out, 2, Some(mf2), false, CrawlLimits::default())
+            .await
+            .unwrap();
+        let second_hits = hits.load(AtomicOrdering::SeqCst);
+        assert!(
+            second_hits > first_hits,
+            "expected a revalidation request on incremental run"
+        );
+    }
+}
