@@ -65,6 +65,7 @@ download_and_install() {
     arch="${platform#*_}"
     local archive_url="https://github.com/${REPO}/releases/download/${version}/${BIN_NAME}-${os}-${arch}.tar.gz"
     local archive_name="${BIN_NAME}-${os}-${arch}.tar.gz"
+    local sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS"
 
     TMPDIR="$(mktemp -d)"
     cd "$TMPDIR"
@@ -72,12 +73,33 @@ download_and_install() {
     info "Downloading ${archive_url} ..."
     if command -v curl >/dev/null 2>&1; then
         curl -sL -o "$archive_name" "$archive_url"
+        curl -sL -o SHA256SUMS "$sums_url" || true
     else
         wget -qO "$archive_name" "$archive_url"
+        wget -qO SHA256SUMS "$sums_url" || true
     fi
 
     if [ ! -f "$archive_name" ] || [ ! -s "$archive_name" ]; then
         return 1
+    fi
+
+    if [ -f SHA256SUMS ] && [ -s SHA256SUMS ]; then
+        info "Verifying checksum ..."
+        if command -v sha256sum >/dev/null 2>&1; then
+            grep " ${archive_name}\$" SHA256SUMS | sha256sum -c - || return 1
+        elif command -v shasum >/dev/null 2>&1; then
+            local expected actual
+            expected=$(grep " ${archive_name}\$" SHA256SUMS | awk '{print $1}')
+            actual=$(shasum -a 256 "$archive_name" | awk '{print $1}')
+            [ -n "$expected" ] && [ "$expected" = "$actual" ] || {
+                warn "Checksum mismatch for ${archive_name}"
+                return 1
+            }
+        else
+            warn "No sha256sum/shasum found — skipping checksum verification"
+        fi
+    else
+        warn "SHA256SUMS not found for this release — skipping checksum verification"
     fi
 
     info "Extracting ..."
@@ -98,6 +120,7 @@ download_and_install() {
 # --- Build from Source (fallback) ------------------------------------
 
 build_from_source() {
+    local version="${1:-}"
     info "Download prebuilt binary failed. Attempting to build from source ..."
 
     if ! command -v cargo >/dev/null 2>&1; then
@@ -109,7 +132,11 @@ build_from_source() {
     cd "$tmp_src"
 
     info "Cloning ${REPO} ..."
-    git clone "https://github.com/${REPO}.git" .
+    if [ -n "$version" ]; then
+        git clone --depth 1 --branch "$version" "https://github.com/${REPO}.git" .
+    else
+        git clone --depth 1 "https://github.com/${REPO}.git" .
+    fi
     cargo build --release
 
     mkdir -p "$INSTALL_DIR"
@@ -155,7 +182,7 @@ main() {
         info "You may need to add '${INSTALL_DIR}' to your PATH."
         info "Try: ${BIN_NAME} --help"
     else
-        build_from_source
+        build_from_source "$version"
         info "${BIN_NAME} installed via cargo."
         info "Try: ${BIN_NAME} --help"
     fi

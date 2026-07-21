@@ -63,12 +63,15 @@ Creates `example.com/` directory with mirrored content + `example.com.zip`.
 | Flag | Default | Description |
 |---|---|---|
 | `-o, --output <DIR>` | domain name | Output directory |
-| `-j, --jobs <N>` | `8` | Concurrent downloads |
+| `-j, --jobs <N>` | `8` | Concurrent downloads (must be ≥ 1) |
 | `--no-zip` | — | Skip ZIP creation |
 | `--fresh` | — | Force full re-download (ignore manifest) |
 | `--robots` | — | Respect robots.txt |
 | `--render <MODE>` | `auto` | SPA rendering: `auto` (detect), `on` (force), `off` (HTTP only) |
 | `--wait <MS>` | `1500` | Settle time (ms) after page load for lazy/AJAX content |
+| `--max-pages <N>` | `10000` | Stop enqueueing after this many HTML pages |
+| `--max-bytes <N>` | `0` | Stop after this many downloaded bytes (`0` = unlimited) |
+| `--no-sandbox` | — | Disable Chromium sandbox (containers/root only) |
 | `-h, --help` | — | Show help |
 | `-V, --version` | — | Show version |
 
@@ -107,7 +110,7 @@ sitegrab https://example.com
 sitegrab --fresh https://example.com
 ```
 
-Rerunning the same URL detects previously downloaded files via SHA-256 hashes. Unchanged files are skipped. The manifest is stored in `<output-dir>/.sitegrab.json`.
+Rerunning the same URL re-crawls from the seed URL. Unchanged files are skipped via conditional requests (`ETag` / `Last-Modified`) when available, otherwise by comparing SHA-256 of the on-disk (rewritten) content stored in `<output-dir>/.sitegrab.json`.
 
 ### Custom output
 
@@ -162,14 +165,14 @@ sitegrab <URL>
     └── ZIP — deflate-compressed archive (skips `.sitegrab.json`)
 ```
 
-- **Language:** Rust — single binary, no runtime dependencies
+- **Language:** Rust — single static binary for HTTP crawl mode
 - **SPA detection:** checks `__NEXT_DATA__`, `ng-version`, `__nuxt__` and more; falls back to heuristics (empty `<body>` + `#root`/`#app` div)
-- **Rendering:** `chromiumoxide` headless Chrome (enabled by default, can be disabled with `--render off`)
+- **Rendering:** `chromiumoxide` headless Chrome/Chromium/Edge (default feature; requires a local browser, or use `--render off`)
 - **Concurrency:** `tokio` `JoinSet` + bounded `Semaphore` (default 8 workers)
 - **Compression:** gzip / brotli / deflate decoding for smaller transfers
 - **HTML parsing:** `scraper` (CSS selectors for `<a>`, `<img>`, `<link>`, `<script>`)
-- **Link rewriting:** regex-based attribute replacement, skips anchors/javascript/mailto/external
-- **Incremental:** SHA-256 hashes stored in `.sitegrab.json`, compared on re-run
+- **Link rewriting:** regex-based attribute replacement (double/single quotes, `data-src`), strips `<base>`, skips anchors/javascript/mailto/external
+- **Incremental:** conditional GET (`ETag` / `Last-Modified`) plus SHA-256 of on-disk rewritten bytes in `.sitegrab.json`
 - **Offline safety:** strips PWA manifests, service workers, modulepreload/script preloads, and `crossorigin` attributes for `file://` compatibility
 - **ZIP:** `zip` crate with deflate compression
 
@@ -177,10 +180,12 @@ sitegrab <URL>
 
 ## Limitations
 
-- **SPA rendering requires a local Chrome/Chromium** installation. When `--render off` is used, client-rendered content won't be captured.
+- **SPA rendering requires a local Chrome/Chromium/Edge** installation (or set `$CHROME`). When `--render off` is used, client-rendered content won't be captured.
 - **No cookie/auth** support.
-- **No rate limiting** — use `-j` to reduce concurrency for polite crawling.
+- **Use `--max-pages` / `--max-bytes` / `-j`** to bound large sites; there is no per-request rate limiter beyond concurrency.
+- **`--no-sandbox`** disables Chromium's sandbox — only use in trusted containers.
 - **Interactive / behind-login content** not captured (no auth flow).
+- **SPA offline pages** strip `<script>` tags so frameworks don't wipe the rendered DOM without APIs.
 
 ---
 
@@ -201,7 +206,16 @@ sitegrab <URL>
 
 ```bash
 cargo test
-cargo build --release
 ```
 
+### Local testing
+
+```bash
+cargo build --release
+./target/release/sitegrab https://example.com
+```
+
+Creates `example.com/` and `example.com.zip` in the current directory. Open `example.com/index.html` to verify offline browsing.
+
 License: MIT
+

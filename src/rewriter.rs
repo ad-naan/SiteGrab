@@ -4,8 +4,10 @@ use std::sync::OnceLock;
 use regex::Regex;
 use url::Url;
 
+use crate::pathmap;
+
 fn relative_path(page_path: &str, target_url: &Url) -> String {
-    let (target_path, _) = url_to_offline_path(target_url);
+    let target_path = pathmap::url_to_offline_path(target_url);
 
     let page_dir = Path::new(page_path)
         .parent()
@@ -55,66 +57,35 @@ fn relative_path(page_path: &str, target_url: &Url) -> String {
 ///   /img/a.png    → ("img/a.png", None)
 ///   /post?id=1    → ("post@id=1/index.html", None)
 fn url_to_offline_path(url: &Url) -> (String, Option<String>) {
-    let raw_path = url.path().trim_start_matches('/');
-    let query = url.query();
-
-    let query_suffix = match query {
-        Some(q) if !q.is_empty() => {
-            let sane: String = q
-                .chars()
-                .map(|c| match c {
-                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                    _ => c,
-                })
-                .collect();
-            format!("@{}", sane)
-        }
-        _ => String::new(),
-    };
-
-    if raw_path.is_empty() || raw_path.ends_with('/') {
-        if query_suffix.is_empty() {
-            return (format!("{}index.html", raw_path), None);
-        }
-        return (format!("{}{}/index.html", raw_path, query_suffix), None);
-    }
-
-    let last_seg = raw_path.rsplit('/').next().unwrap_or("");
-    let has_dot = last_seg.contains('.');
-
-    if has_dot {
-        if query_suffix.is_empty() {
-            return (raw_path.to_string(), None);
-        }
-        let dot_pos = last_seg.rfind('.').unwrap_or(last_seg.len());
-        let (name, ext) = last_seg.split_at(dot_pos);
-        let new_last = format!("{}{}{}", name, query_suffix, ext);
-        if let Some(prefix) = raw_path.strip_suffix(last_seg) {
-            return (
-                format!("{}{}", prefix, new_last),
-                Some(ext.trim_start_matches('.').to_string()),
-            );
-        }
-        return (new_last, Some(ext.trim_start_matches('.').to_string()));
-    }
-
-    if query_suffix.is_empty() {
-        (format!("{}/index.html", raw_path), None)
-    } else {
-        (format!("{}{}/index.html", raw_path, query_suffix), None)
-    }
+    let path = pathmap::url_to_offline_path(url);
+    let ext = Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_string());
+    (path, ext)
 }
 
 fn attr_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?i)((?:\s+(?:href|src|action|poster)\s*=\s*)"([^"]*?)")"#).unwrap()
+        // Double or single quoted href/src/action/poster/data-src/data-lazy-src
+        Regex::new(
+            r#"(?i)(\s+(?:href|src|action|poster|data-src|data-lazy-src)\s*=\s*)(?:"([^"]*?)"|'([^']*?)')"#,
+        )
+        .unwrap()
     })
 }
 
 fn srcset_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?i)(\s+srcset\s*=\s*)"([^"]*?)""#).unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)(\s+srcset\s*=\s*)(?:"([^"]*?)"|'([^']*?)')"#).unwrap()
+    })
+}
+
+fn base_tag_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<base\b[^>]*>"#).unwrap())
 }
 
 fn css_url_regex() -> &'static Regex {
@@ -217,10 +188,18 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
 
     let mut spans: Vec<Span> = Vec::new();
     for m in attr_re.find_iter(html) {
-        spans.push(Span { start: m.start(), end: m.end(), is_srcset: false });
+        spans.push(Span {
+            start: m.start(),
+            end: m.end(),
+            is_srcset: false,
+        });
     }
     for m in srcset_re.find_iter(html) {
-        spans.push(Span { start: m.start(), end: m.end(), is_srcset: true });
+        spans.push(Span {
+            start: m.start(),
+            end: m.end(),
+            is_srcset: true,
+        });
     }
     spans.sort_by_key(|s| s.start);
 
@@ -229,33 +208,43 @@ pub fn rewrite_html(html: &str, page_url: &Url) -> String {
         let matched = &html[span.start..span.end];
 
         if span.is_srcset {
-            let eq_pos = matched.find('=').unwrap();
-            let attr_prefix = matched[..eq_pos].trim_end();
-            let rest = &matched[eq_pos + 1..];
-            let value = &rest[1..rest.len() - 1];
-
-            if let Some(nv) = rewrite_srcset(value, &base_url, &page_path) {
-                result.push_str(&format!("{}=\"{}\"", attr_prefix, nv));
+            if let Some(caps) = srcset_re.captures(matched) {
+                let attr_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let value = caps
+                    .get(2)
+                    .or_else(|| caps.get(3))
+                    .map(|m| m.as_str())
+                    .unwrap_or("");
+                if let Some(nv) = rewrite_srcset(value, &base_url, &page_path) {
+                    result.push_str(&format!("{}\"{}\"", attr_prefix.trim_end(), nv));
+                } else {
+                    result.push_str(matched);
+                }
+            } else {
+                result.push_str(matched);
+            }
+        } else if let Some(caps) = attr_re.captures(matched) {
+            let attr_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let value = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            if let Some(new_path) = rewrite_url_value(value, &base_url, &page_path) {
+                result.push_str(&format!("{}\"{}\"", attr_prefix.trim_end(), new_path));
             } else {
                 result.push_str(matched);
             }
         } else {
-            let eq_pos = matched.find('=').unwrap();
-            let attr_prefix = matched[..eq_pos].trim_end();
-            let quoted_value = &matched[eq_pos + 1..];
-            let value = &quoted_value[1..quoted_value.len() - 1];
-
-            if let Some(new_path) = rewrite_url_value(value, &base_url, &page_path) {
-                result.push_str(&format!("{}=\"{}\"", attr_prefix, new_path));
-            } else {
-                result.push_str(matched);
-            }
+            result.push_str(matched);
         }
 
         last_end = span.end;
     }
 
     result.push_str(&html[last_end..]);
+    // Remove <base> so file:// relative URLs are not re-resolved against the origin.
+    let result = base_tag_regex().replace_all(&result, "").to_string();
     strip_offline_breakers(result)
 }
 
@@ -522,6 +511,36 @@ mod tests {
         let rewritten = rewrite_html(&html, &page);
         assert!(rewritten.contains("big.jpg 2x"));
         assert!(rewritten.contains("huge.jpg 3x"));
+    }
+
+    #[test]
+    fn test_rewrite_html_single_quotes() {
+        let page = Url::parse("https://example.com/about/").unwrap();
+        let html = r#"<a href='https://example.com/'>Home</a>"#.to_string();
+        let rewritten = rewrite_html(&html, &page);
+        assert!(rewritten.contains("../index.html"));
+    }
+
+    #[test]
+    fn test_rewrite_html_data_src() {
+        let page = Url::parse("https://example.com/").unwrap();
+        let html =
+            r#"<img data-src="https://example.com/lazy.png" data-lazy-src='/img/x.jpg'>"#.to_string();
+        let rewritten = rewrite_html(&html, &page);
+        assert!(rewritten.contains("lazy.png"));
+        assert!(rewritten.contains("img/x.jpg"));
+    }
+
+    #[test]
+    fn test_rewrite_html_strips_base_tag() {
+        let page = Url::parse("https://example.com/blog/post/").unwrap();
+        let html = r#"<base href="https://example.com/"><a href="/about">About</a>"#.to_string();
+        let rewritten = rewrite_html(&html, &page);
+        assert!(
+            !rewritten.to_lowercase().contains("<base"),
+            "base tag must be removed: {rewritten}"
+        );
+        assert!(rewritten.contains("../../about/index.html") || rewritten.contains("about/index.html"));
     }
 
     #[test]

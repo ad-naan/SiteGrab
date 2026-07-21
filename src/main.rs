@@ -6,6 +6,7 @@ use url::Url;
 mod archiver;
 mod crawler;
 mod manifest;
+mod pathmap;
 mod rewriter;
 mod util;
 
@@ -63,6 +64,18 @@ struct Args {
     /// Only relevant when rendering is active. Default: 1500
     #[arg(long, default_value = "1500")]
     wait: u64,
+
+    /// Maximum number of HTML pages to download (default: 10000)
+    #[arg(long, default_value = "10000")]
+    max_pages: usize,
+
+    /// Maximum total downloaded bytes (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    max_bytes: u64,
+
+    /// Disable Chromium sandbox (needed in some containers; less secure)
+    #[arg(long)]
+    no_sandbox: bool,
 }
 
 #[tokio::main]
@@ -92,6 +105,15 @@ async fn main() {
     };
 
     let output_dir = args.output.unwrap_or_else(|| host.clone());
+
+    if args.jobs < 1 {
+        eprintln!("error: --jobs must be at least 1");
+        process::exit(1);
+    }
+    if args.max_pages < 1 {
+        eprintln!("error: --max-pages must be at least 1");
+        process::exit(1);
+    }
 
     // Normalise render option: "auto" (default) detects SPA automatically,
     // "on"/"yes" forces render, "off"/"no" forces plain HTTP crawl.
@@ -129,7 +151,7 @@ async fn main() {
     // Load or create manifest
     let (manifest, loaded_existing_manifest) = if args.fresh {
         let _ = std::fs::create_dir_all(&output_dir);
-        let mf = manifest::Manifest::new(url.as_str());
+        let mut mf = manifest::Manifest::new(url.as_str());
         let _ = mf.save_to(&output_dir);
         eprintln!("info: Fresh download, created new manifest");
         (Some(tokio::sync::Mutex::new(mf)), false)
@@ -155,8 +177,15 @@ async fn main() {
     println!("Mirroring: {}", url);
     println!("Output:    {}/", output_dir);
     println!("Workers:   {}", args.jobs);
+    println!("Max pages: {}", args.max_pages);
+    if args.max_bytes > 0 {
+        println!("Max bytes: {}", args.max_bytes);
+    }
     if use_render {
         println!("Mode:      SPA render (headless browser)");
+        if args.no_sandbox {
+            println!("           Chromium --no-sandbox enabled");
+        }
     } else {
         println!("Mode:      plain HTTP crawl");
     }
@@ -165,10 +194,25 @@ async fn main() {
     }
     println!();
 
+    let limits = crawler::CrawlLimits {
+        max_pages: args.max_pages,
+        max_bytes: args.max_bytes,
+    };
+
     let crawl_result = if use_render {
         #[cfg(feature = "render")]
         {
-            crawler::crawl_spa(&url, &output_dir, args.jobs, manifest, args.robots, args.wait).await
+            crawler::crawl_spa(
+                &url,
+                &output_dir,
+                args.jobs,
+                manifest,
+                args.robots,
+                args.wait,
+                limits,
+                args.no_sandbox,
+            )
+            .await
         }
         #[cfg(not(feature = "render"))]
         {
@@ -176,7 +220,7 @@ async fn main() {
             Err(anyhow::anyhow!("render feature not enabled"))
         }
     } else {
-        crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots).await
+        crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots, limits).await
     };
 
     match crawl_result {

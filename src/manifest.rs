@@ -22,6 +22,9 @@ pub struct Entry {
     pub size: u64,
     pub hash: String,
     pub mtime: Option<String>,
+    /// ETag from the origin response, used for conditional revalidation.
+    #[serde(default)]
+    pub etag: Option<String>,
     /// Resource type: "page", "css", "js", "image", "other"
     pub rtype: String,
 }
@@ -50,7 +53,6 @@ impl Manifest {
         }
     }
 
-
     pub fn load_from(dir: &str) -> Result<Option<Self>> {
         let path = Path::new(dir).join(MANIFEST_FILE);
         if !path.exists() {
@@ -63,7 +65,8 @@ impl Manifest {
         Ok(Some(mf))
     }
 
-    pub fn save_to(&self, dir: &str) -> Result<()> {
+    pub fn save_to(&mut self, dir: &str) -> Result<()> {
+        self.updated_at = timestamp();
         let path = Path::new(dir).join(MANIFEST_FILE);
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, content)
@@ -71,7 +74,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Check if a URL's file on disk matches the recorded hash.
+    /// Check if a URL's file on disk matches the recorded hash of written bytes.
     pub fn is_fresh(&self, url: &str, output_dir: &str) -> bool {
         let entry = match self.entries.get(url) {
             Some(e) => e,
@@ -88,13 +91,19 @@ impl Manifest {
         hash_bytes(&bytes) == entry.hash
     }
 
-    /// Record a downloaded file.
+    /// Look up a stored entry by URL.
+    pub fn entry(&self, url: &str) -> Option<&Entry> {
+        self.entries.get(url)
+    }
+
+    /// Record a downloaded file. `bytes` must be the final on-disk content.
     pub fn record(
         &mut self,
         url: String,
         path: String,
         bytes: &[u8],
         mtime: Option<String>,
+        etag: Option<String>,
         rtype: &str,
     ) {
         let h = hash_bytes(bytes);
@@ -105,15 +114,17 @@ impl Manifest {
                 size: bytes.len() as u64,
                 hash: h,
                 mtime,
+                etag,
                 rtype: rtype.to_string(),
             },
         );
     }
+
     /// Get the resource type string for a URL, if known.
+    #[allow(dead_code)]
     pub fn rtype_of(&self, url: &str) -> Option<&str> {
         self.entries.get(url).map(|e| e.rtype.as_str())
     }
-
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -128,6 +139,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     /// Generate a unique test directory under the system temp dir.
     fn test_dir(name: &str) -> String {
@@ -159,9 +172,9 @@ mod tests {
             "index.html".into(),
             b"<html>hello</html>",
             None,
+            Some("\"abc\"".into()),
             "page",
         );
-        // Write the file to disk so is_fresh can verify it
         std::fs::write(Path::new(&dir).join("index.html"), b"<html>hello</html>").unwrap();
         mf.visited.insert("https://example.com/".into());
         mf.save_to(&dir).unwrap();
@@ -173,6 +186,10 @@ mod tests {
         assert!(loaded.visited.contains("https://example.com/"));
         assert!(loaded.is_fresh("https://example.com/", &dir));
         assert_eq!(loaded.rtype_of("https://example.com/"), Some("page"));
+        assert_eq!(
+            loaded.entry("https://example.com/").and_then(|e| e.etag.as_deref()),
+            Some("\"abc\"")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -189,6 +206,7 @@ mod tests {
             "index.html".into(),
             b"original content",
             None,
+            None,
             "page",
         );
 
@@ -202,5 +220,42 @@ mod tests {
     fn test_is_fresh_missing_file() {
         let mf = Manifest::new("https://example.com/");
         assert!(!mf.is_fresh("https://example.com/", "/nonexistent"));
+    }
+
+    #[test]
+    fn test_is_fresh_matches_written_bytes_not_raw() {
+        let dir = test_dir("_test_manifest_written");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let written = b"<a href=\"about/index.html\">About</a>";
+        let mut mf = Manifest::new("https://example.com/");
+        mf.record(
+            "https://example.com/".into(),
+            "index.html".into(),
+            written,
+            None,
+            None,
+            "page",
+        );
+        fs::write(Path::new(&dir).join("index.html"), written).unwrap();
+        assert!(mf.is_fresh("https://example.com/", &dir));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_updated_at_changes_on_save() {
+        let dir = test_dir("_test_manifest_updated");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut mf = Manifest::new("https://example.com/");
+        let created = mf.updated_at.clone();
+        thread::sleep(Duration::from_secs(1));
+        mf.save_to(&dir).unwrap();
+        assert_ne!(mf.updated_at, created);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
