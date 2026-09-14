@@ -1,8 +1,10 @@
 [package]
 name = "sitegrab"
-version = "0.1.0"
+version = "0.5.3"
 edition = "2021"
 description = "Simple website mirroring tool — download, convert links, zip export"
+license = "MIT"
+repository = "https://github.com/kerwin2046/SiteGrab"
 
 [features]
 # SPA rendering (Vue/React/Angular) via headless browser is enabled by default.
@@ -31,3 +33,7 @@ encoding_rs = "0.8"
 # Optional: headless browser for SPA rendering
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"], optional = true }
 futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

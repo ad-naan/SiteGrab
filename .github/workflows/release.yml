@@ -12,12 +12,19 @@ jobs:
     strategy:
       matrix:
         include:
+          # Pin Linux to ubuntu-22.04 (glibc 2.35) so binaries run on
+          # Ubuntu/Pop!_OS 22.04+ — ubuntu-latest (24.04) requires glibc 2.39.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: sitegrab-linux-x86_64.tar.gz
             binary: sitegrab
+          # Fully static musl build — runs on any Linux regardless of glibc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            archive: sitegrab-linux-x86_64-musl.tar.gz
+            binary: sitegrab
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: sitegrab-linux-aarch64.tar.gz
             binary: sitegrab
           - target: x86_64-apple-darwin
@@ -31,6 +38,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: sitegrab-windows-x86_64.zip
+            binary: sitegrab.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +57,12 @@ jobs:
           [target.aarch64-unknown-linux-gnu]
           linker = "aarch64-linux-gnu-gcc"
           EOF
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -90,11 +104,16 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Verify archives
-        run: ls -lh sitegrab-*
+      - name: Verify archives and checksums
+        run: |
+          ls -lh sitegrab-*
+          sha256sum sitegrab-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: sitegrab-*
+          files: |
+            sitegrab-*
+            SHA256SUMS
           generate_release_notes: true

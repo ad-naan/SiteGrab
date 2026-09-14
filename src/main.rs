@@ -1,27 +1,10 @@
 use std::process;
 
 use clap::Parser;
+use sitegrab::crawler;
+use sitegrab::manifest;
+use sitegrab::offline;
 use url::Url;
-
-mod archiver;
-mod crawler;
-mod manifest;
-mod rewriter;
-mod util;
-
-#[cfg(feature = "render")]
-mod renderer;
-
-/// SPA rendering mode (validated by clap — invalid values exit with an error).
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum RenderMode {
-    /// Auto-detect whether the site is a SPA and render if needed
-    Auto,
-    /// Force headless-browser rendering for every page
-    On,
-    /// Plain HTTP crawling only (no browser)
-    Off,
-}
 
 #[derive(Parser)]
 #[command(
@@ -74,6 +57,18 @@ struct Args {
     /// Only relevant when rendering is active. Default: 1500
     #[arg(long, default_value = "1500")]
     wait: u64,
+
+    /// Maximum number of HTML pages to download (default: 10000)
+    #[arg(long, default_value = "10000")]
+    max_pages: usize,
+
+    /// Maximum total downloaded bytes (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    max_bytes: u64,
+
+    /// Disable Chromium sandbox (needed in some containers; less secure)
+    #[arg(long)]
+    no_sandbox: bool,
 }
 
 #[tokio::main]
@@ -134,7 +129,7 @@ async fn main() {
     // Load or create manifest
     let (manifest, loaded_existing_manifest) = if args.fresh {
         let _ = std::fs::create_dir_all(&output_dir);
-        let mf = manifest::Manifest::new(url.as_str());
+        let mut mf = manifest::Manifest::new(url.as_str());
         let _ = mf.save_to(&output_dir);
         eprintln!("info: Fresh download, created new manifest");
         (Some(tokio::sync::Mutex::new(mf)), false)
@@ -146,12 +141,22 @@ async fn main() {
             }
             Ok(None) => {
                 let _ = std::fs::create_dir_all(&output_dir);
-                (Some(tokio::sync::Mutex::new(manifest::Manifest::new(url.as_str()))), false)
+                (
+                    Some(tokio::sync::Mutex::new(manifest::Manifest::new(
+                        url.as_str(),
+                    ))),
+                    false,
+                )
             }
             Err(e) => {
                 eprintln!("warning: Failed to load manifest: {e}, starting fresh");
                 let _ = std::fs::create_dir_all(&output_dir);
-                (Some(tokio::sync::Mutex::new(manifest::Manifest::new(url.as_str()))), false)
+                (
+                    Some(tokio::sync::Mutex::new(manifest::Manifest::new(
+                        url.as_str(),
+                    ))),
+                    false,
+                )
             }
         }
     };
@@ -159,8 +164,12 @@ async fn main() {
     println!("sitegrab v{}", env!("CARGO_PKG_VERSION"));
     println!("Mirroring: {}", url);
     println!("Output:    {}/", output_dir);
-    println!("Workers:   {}", args.jobs);    if use_render {
+    println!("Workers:   {}", args.jobs);
+    if use_render {
         println!("Mode:      SPA render (headless browser)");
+        if args.no_sandbox {
+            println!("           Chromium --no-sandbox enabled");
+        }
     } else {
         println!("Mode:      plain HTTP crawl");
     }
@@ -169,30 +178,47 @@ async fn main() {
     }
     println!();
 
+    let limits = crawler::CrawlLimits {
+        max_pages: args.max_pages,
+        max_bytes: args.max_bytes,
+    };
+
     let crawl_result = if use_render {
         #[cfg(feature = "render")]
-        {
-            crawler::crawl_spa(&url, &output_dir, args.jobs as usize, manifest, args.robots, args.wait).await
-        }
+        {}
         #[cfg(not(feature = "render"))]
         {
             // Unreachable — guarded above
             Err(anyhow::anyhow!("render feature not enabled"))
         }
     } else {
-        crawler::crawl(&url, &output_dir, args.jobs as usize, manifest, args.robots).await
+        crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots, limits).await
     };
 
     match crawl_result {
         Ok(stats) => {
             if !args.no_zip {
                 let zip_path = format!("{}.zip", output_dir);
-                if let Err(e) = archiver::create_zip(&output_dir, &zip_path) {
+                if let Err(e) = sitegrab::archiver::create_zip(&output_dir, &zip_path) {
                     eprintln!("warning: Failed to create zip: {e}");
+                } else if let Err(e) = offline::assert_offline_closure(&output_dir, &host) {
+                    eprintln!("warning: Offline closure check failed: {e}");
                 }
+            } else if let Err(e) = offline::assert_offline_closure(&output_dir, &host) {
+                eprintln!("warning: Offline closure check failed: {e}");
             }
-            if stats.errors > 0 {
-                println!("⚠  {} errors (see above)", stats.errors);
+
+            match stats.outcome {
+                crawler::CrawlOutcome::Complete => {}
+                crawler::CrawlOutcome::Partial => {
+                    if stats.errors > 0 {
+                        eprintln!("warning: {} resource errors during crawl", stats.errors);
+                    }
+                    process::exit(2);
+                }
+                crawler::CrawlOutcome::Failed => {
+                    process::exit(1);
+                }
             }
         }
         Err(e) => {
