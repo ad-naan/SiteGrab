@@ -205,6 +205,11 @@ fn extract_urls(doc: &Html, page_url: &Url, base_host: &str) -> Vec<Url> {
         ("source[src]", "src"),
         ("video[src]", "src"),
         ("audio[src]", "src"),
+        ("iframe[src]", "src"),
+        ("embed[src]", "src"),
+        ("object[data]", "data"),
+        ("track[src]", "src"),
+        ("input[type=image][src]", "src"),
         // Lazy-load attributes
         ("img[data-src]", "data-src"),
         ("img[data-lazy-src]", "data-lazy-src"),
@@ -227,8 +232,8 @@ fn extract_urls(doc: &Html, page_url: &Url, base_host: &str) -> Vec<Url> {
         }
     }
 
-    // Parse srcset attributes (img[srcset], source[srcset])
-    for sel_str in &["img[srcset]", "source[srcset]"] {
+    // Parse srcset attributes (img/source, incl. lazy data-srcset)
+    for sel_str in &["img[srcset]", "source[srcset]", "img[data-srcset]", "source[data-srcset]"] {
         if let Ok(sel) = Selector::parse(sel_str) {
             for elem in doc.select(&sel) {
                 if let Some(srcset) = elem.value().attr("srcset") {
@@ -278,6 +283,50 @@ fn normalize_url(url: &Url) -> Url {
 /// Maximum retry attempts for transient errors (5xx, connection failures).
 const MAX_RETRIES: u32 = 2;
 
+/// Decode a response body to a String, honouring the charset from the
+/// Content-Type header. Falls back to `<meta charset>` sniffing on the first
+/// 2 KB of HTML, then to UTF-8 (lossless for already-UTF-8 content).
+pub(crate) fn decode_body(bytes: &[u8], content_type: Option<&str>) -> String {
+    // 1. Fast path: valid UTF-8 — covers the overwhelming majority of sites.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+
+    // 2. Charset from Content-Type: "text/html; charset=gbk"
+    let header_charset = content_type
+        .and_then(|ct| {
+            ct.split(';')
+                .filter_map(|p| p.trim().strip_prefix("charset=").map(|s| s.trim()))
+                .next()
+        })
+        .map(|s| s.to_string());
+
+    // 3. <meta charset> sniffing (first 2 KB)
+    let meta_charset = sniff_meta_charset(bytes);
+
+    for charset in [header_charset, meta_charset].into_iter().flatten() {
+        if let Some(enc) = encoding_rs::Encoding::for_label(charset.as_bytes()) {
+            let (decoded, _, _) = enc.decode(bytes);
+            return decoded.into_owned();
+        }
+    }
+
+    // 4. Final fallback: lossy UTF-8 (replacement chars for invalid bytes).
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Sniff `<meta charset="...">` / `<meta http-equiv="content-type" ...>` from
+/// the first 2 KB of an HTML document, ASCII-decoded case-insensitively.
+fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(2048)];
+    let ascii = String::from_utf8_lossy(head).to_lowercase();
+
+    let re = regex::Regex::new(r#"<meta[^>]*charset\s*=\s*["']?\s*([a-z0-9_\-:.]+)"#)
+        .ok()?;    re.captures(&ascii)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
 /// Process a single URL: download (with retry), save, return discovered links.
 pub(crate) async fn process_one(
     client: &Client,
@@ -302,10 +351,15 @@ pub(crate) async fn process_one(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    // Use the post-redirect final URL for the save path and link rewriting,
+    // so /old → /new is stored once at /new instead of duplicated.
+    // (Extract before `bytes()` consumes the response.)
+    let final_url: Url = response.url().clone();
+
     let body = response.bytes().await?;
     let rtype = classify(content_type.as_deref(), url);
 
-    let save_path = url_to_path(url, output_base);
+    let save_path = url_to_path(&final_url, output_base);
     let save_path_rel = save_path
         .strip_prefix(output_base)
         .unwrap_or(&save_path)
@@ -321,21 +375,21 @@ pub(crate) async fn process_one(
     // For everything else (JS, images, fonts), save raw bytes.
     let new_urls = match rtype {
         ResourceType::Page => {
-            let html_str = String::from_utf8_lossy(&body);
-            let rewritten = rewriter::rewrite_html(&html_str, url);
+            let html_str = decode_body(&body, content_type.as_deref());
+            let rewritten = rewriter::rewrite_html(&html_str, &final_url);
             tokio::fs::write(&save_path, rewritten.as_bytes()).await?;
 
             let doc = Html::parse_document(&html_str);
-            let host = url.host_str().unwrap_or("");
-            extract_urls(&doc, url, host)
+            let host = final_url.host_str().unwrap_or("");
+            extract_urls(&doc, &final_url, host)
         }
         ResourceType::Css => {
-            let css_str = String::from_utf8_lossy(&body);
-            let rewritten = rewriter::rewrite_css(&css_str, url);
+            let css_str = decode_body(&body, content_type.as_deref());
+            let rewritten = rewriter::rewrite_css(&css_str, &final_url);
             tokio::fs::write(&save_path, rewritten.as_bytes()).await?;
 
-            let host = url.host_str().unwrap_or("");
-            extract_css_urls(&css_str, url, host)
+            let host = final_url.host_str().unwrap_or("");
+            extract_css_urls(&css_str, &final_url, host)
         }
         _ => {
             tokio::fs::write(&save_path, &body).await?;
@@ -343,7 +397,7 @@ pub(crate) async fn process_one(
         }
     };
 
-    let norm = normalize_url(url);
+    let norm = normalize_url(&final_url);
     Ok(ProcessResult {
         rtype,
         url: norm.as_str().to_string(),
@@ -519,6 +573,45 @@ impl RobotsChecker {
 #[cfg(test)]
 mod robots_tests {
     use super::*;
+
+    #[test]
+    fn test_decode_body_gbk() {
+        // "中文" encoded in GBK
+        let gbk_bytes: &[u8] = &[0xd6, 0xd0, 0xce, 0xc4];
+        let s = decode_body(gbk_bytes, Some("text/html; charset=gbk"));
+        assert_eq!(s, "中文");
+    }
+
+    #[test]
+    fn test_decode_body_meta_charset_sniff() {
+        // <meta charset="gbk"> + GBK body bytes
+        let mut bytes = b"<meta charset=\"gbk\">".to_vec();
+        bytes.extend_from_slice(&[0xd6, 0xd0, 0xce, 0xc4]);
+        let s = decode_body(&bytes, Some("text/html"));
+        assert_eq!(s, "<meta charset=\"gbk\">中文");
+    }
+
+    #[test]
+    fn test_decode_body_utf8_passthrough() {
+        let s = decode_body("hello 中文".as_bytes(), Some("text/html; charset=utf-8"));
+        assert_eq!(s, "hello 中文");
+    }
+
+    #[test]
+    fn test_extract_urls_iframe_and_track() {
+        let html = r#"<html><body>
+            <iframe src="/embed/1"></iframe>
+            <track src="/subs/en.vtt"></track>
+            <input type="image" src="/img/btn.png">
+        </body></html>"#;
+        let page = Url::parse("https://example.com/page").unwrap();
+        let doc = Html::parse_document(html);
+        let urls = extract_urls(&doc, &page, "example.com");
+        let paths: Vec<String> = urls.iter().map(|u| u.path().to_string()).collect();
+        assert!(paths.contains(&"/embed/1".to_string()), "iframe missing: {paths:?}");
+        assert!(paths.contains(&"/subs/en.vtt".to_string()), "track missing: {paths:?}");
+        assert!(paths.contains(&"/img/btn.png".to_string()), "input image missing: {paths:?}");
+    }
 
     #[test]
     fn test_robots_no_rules() {
