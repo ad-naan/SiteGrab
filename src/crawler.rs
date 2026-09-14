@@ -380,8 +380,7 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
     let head = &bytes[..bytes.len().min(2048)];
     let ascii = String::from_utf8_lossy(head).to_lowercase();
 
-    let re =
-        regex::Regex::new(r#"<meta[^>]*charset\s*=\s*[\"']?\s*([a-z0-9_\-:.]+)"#).ok()?;
+    let re = regex::Regex::new(r#"<meta[^>]*charset\s*=\s*[\"']?\s*([a-z0-9_\-:.]+)"#).ok()?;
     re.captures(&ascii)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
@@ -524,13 +523,13 @@ pub(crate) async fn process_one(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    let body = response.bytes().await?;
-    let rtype = classify(content_type.as_deref(), url);
-
     // Use the post-redirect final URL for the save path and link rewriting,
     // so /old → /new is stored once at /new instead of duplicated.
     // (Extracted before `bytes()` consumed the response.)
     let final_url: Url = response.url().clone();
+
+    let body = response.bytes().await?;
+    let rtype = classify(content_type.as_deref(), url);
 
     let save_path_rel = save_path
         .strip_prefix(output_base)
@@ -587,6 +586,7 @@ pub(crate) async fn process_one(
     let canonical = canonical_url(&final_url, base_host, rtype);
     Ok(ProcessResult {
         rtype,
+        url: canonical.as_str().to_string(),
         original_url: url.as_str().to_string(),
         save_path: save_path_rel,
         new_urls,
@@ -861,9 +861,18 @@ mod robots_tests {
         let doc = Html::parse_document(html);
         let urls = extract_urls(&doc, &page, "example.com", None);
         let paths: Vec<String> = urls.iter().map(|u| u.path().to_string()).collect();
-        assert!(paths.contains(&"/embed/1".to_string()), "iframe missing: {paths:?}");
-        assert!(paths.contains(&"/subs/en.vtt".to_string()), "track missing: {paths:?}");
-        assert!(paths.contains(&"/img/btn.png".to_string()), "input image missing: {paths:?}");
+        assert!(
+            paths.contains(&"/embed/1".to_string()),
+            "iframe missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/subs/en.vtt".to_string()),
+            "track missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/img/btn.png".to_string()),
+            "input image missing: {paths:?}"
+        );
     }
 
     #[test]

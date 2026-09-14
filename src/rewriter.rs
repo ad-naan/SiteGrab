@@ -175,11 +175,6 @@ pub fn strip_scripts(html: &str) -> String {
     result.push_str(&html[last_end..]);
     result
 }
-    if !html.to_lowercase().contains("<script") {
-        return html.to_string();
-    }
-    script_tag_regex().replace_all(html, "").to_string()
-}
 
 fn split_fragment(value: &str) -> (String, Option<String>) {
     match value.find('#') {
@@ -321,7 +316,8 @@ pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Opti
                 }
             }
             SpanKind::Style => {
-                if let Some(nv) = rewrite_inline_style(value, &base_url, &page_path, base_host, base_port)
+                if let Some(nv) =
+                    rewrite_inline_style(value, &base_url, &page_path, base_host, base_port)
                 {
                     result.push_str(&format!("{}=\"{}\"", attr_prefix, nv));
                 } else {
@@ -338,9 +334,6 @@ pub fn rewrite_html(html: &str, page_url: &Url, base_host: &str, base_port: Opti
                 }
             }
         }
-
-        last_end = span.end;
-    }
 
         last_end = span.end;
     }
@@ -496,7 +489,8 @@ fn rewrite_inline_style(
         if url_text.starts_with("data:") {
             continue;
         }
-        if let Some(new_path) = rewrite_url_value(url_text, base_url, page_path, base_host, base_port)
+        if let Some(new_path) =
+            rewrite_url_value(url_text, base_url, page_path, base_host, base_port)
         {
             result.push_str(&value[last_end..m.start()]);
             result.push_str(&format!("url({})", new_path));

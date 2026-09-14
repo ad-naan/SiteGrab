@@ -1,10 +1,20 @@
 use std::process;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use sitegrab::crawler;
 use sitegrab::manifest;
 use sitegrab::offline;
 use url::Url;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RenderMode {
+    /// Detect whether the site is a SPA and render only if needed
+    Auto,
+    /// Force headless-browser rendering for every page
+    On,
+    /// Plain HTTP crawling only
+    Off,
+}
 
 #[derive(Parser)]
 #[command(
@@ -185,14 +195,34 @@ async fn main() {
 
     let crawl_result = if use_render {
         #[cfg(feature = "render")]
-        {}
+        {
+            crawler::crawl_spa(
+                &url,
+                &output_dir,
+                args.jobs as usize,
+                manifest,
+                args.robots,
+                args.wait,
+                limits,
+                args.no_sandbox,
+            )
+            .await
+        }
         #[cfg(not(feature = "render"))]
         {
             // Unreachable — guarded above
             Err(anyhow::anyhow!("render feature not enabled"))
         }
     } else {
-        crawler::crawl(&url, &output_dir, args.jobs, manifest, args.robots, limits).await
+        crawler::crawl(
+            &url,
+            &output_dir,
+            args.jobs as usize,
+            manifest,
+            args.robots,
+            limits,
+        )
+        .await
     };
 
     match crawl_result {
